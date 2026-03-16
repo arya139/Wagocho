@@ -1,4 +1,4 @@
-# Tachdict
+# Wagoshõ
 
 Desktop vocabulary tracker
 
