@@ -1,4 +1,4 @@
-# Wagoshõ
+# Wagochō
 
 Desktop vocabulary tracker
 
