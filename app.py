@@ -323,14 +323,16 @@ class QuizWindow(tk.Toplevel):
         "Word → Meaning/Comment": ("word",    "comment"),
     }
 
-    def __init__(self, parent, words):
+    def __init__(self, parent, words, categories=None):
         super().__init__(parent)
         self.title("練習 — Quiz")
-        self.geometry("520x560")
+        self.geometry("520x600")
         self.resizable(True, True)
         self.after(50, lambda: _safe_grab(self))
 
-        self.words   = [w for w in words if w.get("word")]
+        self.all_words  = [w for w in words if w.get("word")]
+        self.categories = ["All Categories"] + sorted(categories or [])
+        self.words   = self.all_words.copy()
         self.deck    = []
         self.idx     = 0
         self.correct = 0
@@ -339,7 +341,7 @@ class QuizWindow(tk.Toplevel):
         self.build_ui()
         self.update_theme()
 
-        if not self.words:
+        if not self.all_words:
             lbl(self, "No words to quiz!", fg=C["ink2"]).pack(expand=True)
             self.card.pack_forget()
             return
@@ -368,6 +370,18 @@ class QuizWindow(tk.Toplevel):
         self.restart_btn = FlatButton(self.mode_row, "↺ Restart", command=self._new_deck,
                    font=FONT_UIS, padx=10, pady=4)
         self.restart_btn.pack(side="right")
+
+        self.cat_row = tk.Frame(self, padx=16, pady=4)
+        self.cat_row.pack(fill="x")
+        self.cat_lbl_q = lbl(self.cat_row, "Category:", font=FONT_UIS, fg=C["ink2"])
+        self.cat_lbl_q.pack(side="left")
+        self.quiz_cat_var = tk.StringVar(value="All Categories")
+        self.quiz_cat_menu = ttk.OptionMenu(self.cat_row, self.quiz_cat_var,
+                                             "All Categories", *self.categories,
+                                             command=lambda _: self._apply_cat_filter())
+        self.quiz_cat_menu.pack(side="left", padx=8)
+        self.deck_lbl = lbl(self.cat_row, "", font=FONT_UIS, fg=C["ink3"])
+        self.deck_lbl.pack(side="right")
 
         self.sep = sep(self)
         self.sep.pack(fill="x")
@@ -424,6 +438,9 @@ class QuizWindow(tk.Toplevel):
         self.mode_row.config(bg=C["bg2"])
         self.mode_lbl.config(bg=C["bg2"], fg=C["ink2"])
         self.restart_btn.set_colors(bg=C["bg3"], fg=C["ink2"], hover_bg=C["bg2"])
+        self.cat_row.config(bg=C["bg2"])
+        self.cat_lbl_q.config(bg=C["bg2"], fg=C["ink2"])
+        self.deck_lbl.config(bg=C["bg2"], fg=C["ink3"])
         self.sep.config(bg=C["bg3"])
         self.card.config(bg=C["bg"])
         self.progress_lbl.config(bg=C["bg"], fg=C["ink3"])
@@ -441,15 +458,31 @@ class QuizWindow(tk.Toplevel):
         self.fb_hint.config(bg=C["bg"], fg=C["ink3"])
         self.next_btn.set_colors(bg=C["blue"], fg=C["white"], hover_bg=C["blue2"])
 
+    def _apply_cat_filter(self):
+        sel = self.quiz_cat_var.get()
+        if sel == "All Categories":
+            self.words = self.all_words.copy()
+        else:
+            self.words = [w for w in self.all_words if (w.get("category","") or "Uncategorized") == sel]
+        n = len(self.words)
+        self.deck_lbl.config(text=f"{n} word{'s' if n!=1 else ''}")
+        if n == 0:
+            messagebox.showinfo("No words", f"No words in category '{sel}'.", parent=self)
+        else:
+            self._new_deck()
+
     def _new_deck(self, *_):
         for w in self.card.winfo_children():
             w.destroy()
         self._build_card_widgets()
         self.update_theme()
 
-        self.deck    = self.words.copy()
+        self.deck = self.words.copy()
         random.shuffle(self.deck)
         self.idx = self.correct = self.wrong = 0
+        n = len(self.deck)
+        if hasattr(self, "deck_lbl"):
+            self.deck_lbl.config(text=f"{n} word{'s' if n!=1 else ''}")
         self._next_card()
 
     def _next_card(self):
@@ -512,11 +545,10 @@ class QuizWindow(tk.Toplevel):
             w.destroy()
         total = self.correct + self.wrong
         pct   = int(self.correct / total * 100) if total else 0
-        grade = {
-                    "🏆 Excellent!" if pct >= 90 else 
-                    "👍 Good job!"  if pct >= 70 else 
-                    "📖 Keep studying!" if pct >= 50 else "😤 More practice!"
-        }
+        if   pct >= 90: grade = "🏆 Excellent!"
+        elif pct >= 70: grade = "👍 Good job!"
+        elif pct >= 50: grade = "📖 Keep studying!"
+        else:           grade = "😤 More practice!"
         
         lbl(self.card, grade, font=FONT_H1, fg=C["ink"], bg=C["bg"]).pack(pady=(30,8))
         lbl(self.card, f"{self.correct} / {total}  ({pct}%)",
@@ -533,6 +565,257 @@ class QuizWindow(tk.Toplevel):
         close_btn.pack(pady=(8,0))
         close_btn.set_colors(bg=C["bg3"], fg=C["ink2"], hover_bg=C["bg2"])
 
+
+
+# category manager
+class CategoryManagerDialog(tk.Toplevel):
+    """Rename, merge, or delete categories across the whole dictionary."""
+
+    def __init__(self, parent, data):
+        super().__init__(parent)
+        self.title("Manage Categories")
+        self.resizable(False, False)
+        self.data = data
+        self.after(50, lambda: _safe_grab(self))
+        self._build_ui()
+        self._update_theme()
+        self._center(parent)
+
+    def _build_ui(self):
+        self.hdr = tk.Frame(self, pady=14)
+        self.hdr.pack(fill="x")
+        self.hdr_lbl = lbl(self.hdr, "⚙  Manage Categories", font=FONT_H2, fg=C["white"])
+        self.hdr_lbl.pack(padx=20, anchor="w")
+
+        self.body = tk.Frame(self, padx=20, pady=12)
+        self.body.pack(fill="both", expand=True)
+
+        self.info_lbl = lbl(self.body, "Select a category to rename, merge, or delete it.",
+                             font=FONT_UIS, fg=C["ink2"])
+        self.info_lbl.pack(anchor="w", pady=(0, 8))
+
+        # listbox of categories
+        lb_frame = tk.Frame(self.body)
+        lb_frame.pack(fill="both", expand=True)
+        self.lb = tk.Listbox(lb_frame, font=FONT_UI, relief="flat", bd=0,
+                              highlightthickness=1, width=32, height=12,
+                              selectmode="single", activestyle="none")
+        lb_sb = ttk.Scrollbar(lb_frame, orient="vertical", command=self.lb.yview)
+        self.lb.config(yscrollcommand=lb_sb.set)
+        self.lb.pack(side="left", fill="both", expand=True)
+        lb_sb.pack(side="right", fill="y")
+        self.lb.bind("<<ListboxSelect>>", self._on_select)
+        self._populate_lb()
+
+        sep(self.body).pack(fill="x", pady=10)
+
+        # action buttons
+        btn_row = tk.Frame(self.body)
+        btn_row.pack(fill="x")
+        self.rename_btn = FlatButton(btn_row, "✎ Rename…", command=self._rename,
+                    font=FONT_UIS, padx=10, pady=5)
+        self.rename_btn.pack(side="left", padx=(0,6))
+        self.merge_btn = FlatButton(btn_row, "⇒ Merge into…", command=self._merge,
+                    font=FONT_UIS, padx=10, pady=5)
+        self.merge_btn.pack(side="left", padx=(0,6))
+        self.del_btn = FlatButton(btn_row, "🗑 Delete", command=self._delete,
+                    font=FONT_UIS, padx=10, pady=5)
+        self.del_btn.pack(side="left")
+
+        sep(self.body).pack(fill="x", pady=10)
+
+        # add new category
+        new_row = tk.Frame(self.body)
+        new_row.pack(fill="x")
+        self.new_var = tk.StringVar()
+        self.new_entry = tk.Entry(new_row, textvariable=self.new_var, font=FONT_UI,
+                                   relief="flat", bd=0, highlightthickness=1, width=20)
+        self.new_entry.pack(side="left", ipady=5, padx=(0,8))
+        self.new_entry.bind("<Return>", lambda e: self._add_cat())
+        add_btn = FlatButton(new_row, "+ Add Category", command=self._add_cat,
+                    font=FONT_UIS, padx=10, pady=5)
+        add_btn.pack(side="left")
+        self.new_add_btn = add_btn
+
+        sep(self.body).pack(fill="x", pady=10)
+        close_btn = FlatButton(self.body, "Done", command=self.destroy,
+                    font=FONT_UI, padx=14, pady=7)
+        close_btn.pack(anchor="e")
+        self.close_btn = close_btn
+
+    def _cats(self):
+        cats = sorted({w.get("category","") or "Uncategorized"
+                       for w in self.data.get("words", [])})
+        extras = [c for c in self.data.get("categories", []) if c not in cats]
+        return cats + sorted(extras)
+
+    def _populate_lb(self, select=None):
+        self.lb.delete(0, "end")
+        counts = {}
+        for w in self.data.get("words", []):
+            c = w.get("category","") or "Uncategorized"
+            counts[c] = counts.get(c, 0) + 1
+        self._cat_list = self._cats()
+        for c in self._cat_list:
+            n = counts.get(c, 0)
+            self.lb.insert("end", f"  {c}  ({n} word{'s' if n!=1 else ''})")
+        if select and select in self._cat_list:
+            i = self._cat_list.index(select)
+            self.lb.selection_set(i)
+            self.lb.see(i)
+
+    def _selected_cat(self):
+        sel = self.lb.curselection()
+        if not sel:
+            return None
+        return self._cat_list[sel[0]]
+
+    def _on_select(self, *_):
+        pass  # could enable/disable buttons here
+
+    def _rename(self):
+        old = self._selected_cat()
+        if not old:
+            messagebox.showwarning("Nothing selected", "Select a category first.", parent=self)
+            return
+        new = simpledialog.askstring("Rename", f"New name for '{old}':", initialvalue=old, parent=self)
+        if not new or not new.strip() or new.strip() == old:
+            return
+        new = new.strip()
+        if new in self._cats():
+            messagebox.showwarning("Exists", f"'{new}' already exists. Use Merge instead.", parent=self)
+            return
+        for w in self.data["words"]:
+            if (w.get("category","") or "Uncategorized") == old:
+                w["category"] = new
+        cats = self.data.get("categories", [])
+        if old in cats:
+            cats[cats.index(old)] = new
+        if new not in cats:
+            cats.append(new)
+        self._populate_lb(select=new)
+
+    def _merge(self):
+        old = self._selected_cat()
+        if not old:
+            messagebox.showwarning("Nothing selected", "Select a category to merge.", parent=self)
+            return
+        targets = [c for c in self._cats() if c != old]
+        if not targets:
+            messagebox.showinfo("No targets", "No other categories to merge into.", parent=self)
+            return
+        dlg = _PickDialog(self, "Merge Into", f"Merge  '{old}'  into:", targets)
+        self.wait_window(dlg)
+        if not dlg.result:
+            return
+        target = dlg.result
+        for w in self.data["words"]:
+            if (w.get("category","") or "Uncategorized") == old:
+                w["category"] = target
+        cats = self.data.get("categories", [])
+        if old in cats:
+            cats.remove(old)
+        self._populate_lb(select=target)
+
+    def _delete(self):
+        cat = self._selected_cat()
+        if not cat:
+            messagebox.showwarning("Nothing selected", "Select a category to delete.", parent=self)
+            return
+        count = sum(1 for w in self.data["words"] if (w.get("category","") or "Uncategorized") == cat)
+        if count > 0:
+            move = messagebox.askyesno(
+                "Move words?",
+                f"'{cat}' has {count} word(s).\nMove them to 'Uncategorized' before deleting?",
+                parent=self)
+            if not move:
+                return
+            for w in self.data["words"]:
+                if (w.get("category","") or "Uncategorized") == cat:
+                    w["category"] = "Uncategorized"
+        cats = self.data.get("categories", [])
+        if cat in cats:
+            cats.remove(cat)
+        self._populate_lb()
+
+    def _add_cat(self):
+        name = self.new_var.get().strip()
+        if not name:
+            return
+        cats = self.data.setdefault("categories", [])
+        if name not in cats:
+            cats.append(name)
+        self.new_var.set("")
+        self._populate_lb(select=name)
+
+    def _update_theme(self):
+        self.configure(bg=C["bg"])
+        self.hdr.config(bg=C["sidebar"])
+        self.hdr_lbl.config(bg=C["sidebar"], fg=C["white"])
+        self.body.config(bg=C["bg"])
+        self.info_lbl.config(bg=C["bg"], fg=C["ink2"])
+        self.lb.config(bg=C["entry_bg"], fg=C["entry_fg"],
+                        selectbackground=C["sel"], selectforeground=C["ink"],
+                        highlightbackground=C["bg3"])
+        self.rename_btn.set_colors(C["bg2"], C["ink2"], C["bg3"])
+        self.merge_btn.set_colors(C["blue"], C["white"], C["blue2"])
+        self.del_btn.set_colors(C["red"], C["white"], C["red2"])
+        self.new_entry.config(bg=C["entry_bg"], fg=C["entry_fg"],
+                               insertbackground=C["entry_fg"],
+                               highlightbackground=C["bg3"], highlightcolor=C["red"])
+        self.new_add_btn.set_colors(C["bg2"], C["ink2"], C["bg3"])
+        self.close_btn.set_colors(C["red"], C["white"], C["red2"])
+
+    def _center(self, parent):
+        self.update_idletasks()
+        pw, ph = parent.winfo_width(), parent.winfo_height()
+        px, py = parent.winfo_x(), parent.winfo_y()
+        w, h = self.winfo_reqwidth(), self.winfo_reqheight()
+        self.geometry(f"{w}x{h}+{px+pw//2-w//2}+{py+ph//2-h//2}")
+
+
+class _PickDialog(tk.Toplevel):
+    """Simple single-pick listbox dialog."""
+    def __init__(self, parent, title, prompt, options):
+        super().__init__(parent)
+        self.title(title)
+        self.resizable(False, False)
+        self.result = None
+        self.after(50, lambda: _safe_grab(self))
+        self.configure(bg=C["bg"])
+
+        lbl(self, prompt, font=FONT_UI, fg=C["ink"], bg=C["bg"]).pack(padx=20, pady=(16,8))
+        self.lb = tk.Listbox(self, font=FONT_UI, relief="flat", bd=0, highlightthickness=1,
+                              width=28, height=min(10, len(options)), activestyle="none",
+                              bg=C["entry_bg"], fg=C["entry_fg"],
+                              selectbackground=C["sel"], selectforeground=C["ink"],
+                              highlightbackground=C["bg3"])
+        self.lb.pack(padx=20, pady=4)
+        for o in options:
+            self.lb.insert("end", f"  {o}")
+        self.lb.bind("<Double-1>", lambda e: self._pick())
+        self._options = options
+
+        btn_row = tk.Frame(self, bg=C["bg"], pady=12)
+        btn_row.pack()
+        ok = FlatButton(btn_row, "OK", command=self._pick, font=FONT_UI, padx=12, pady=6)
+        ok.pack(side="left", padx=6)
+        ok.set_colors(C["red"], C["white"], C["red2"])
+        ca = FlatButton(btn_row, "Cancel", command=self.destroy, font=FONT_UI, padx=12, pady=6)
+        ca.pack(side="left", padx=6)
+        ca.set_colors(C["bg3"], C["ink2"], C["bg2"])
+
+        self.update_idletasks()
+        px, py = parent.winfo_x(), parent.winfo_y()
+        pw, ph = parent.winfo_width(), parent.winfo_height()
+        w, h = self.winfo_reqwidth(), self.winfo_reqheight()
+        self.geometry(f"{w}x{h}+{px+pw//2-w//2}+{py+ph//2-h//2}")
+
+    def _pick(self):
+        sel = self.lb.curselection()
+        if sel:
+            self.result = self._options[sel[0]]
+            self.destroy()
 
 # stats
 class StatsDialog(tk.Toplevel):
@@ -656,11 +939,17 @@ class App(tk.Tk):
         self.all_words    = []
         self._sort_col    = "word"
         self._sort_rev    = False
+        self._selected_cats = set()   # empty = All
+        self._cat_chip_btns = {}      # cat -> FlatButton
 
         self._build_menu()
         self._build_ui()
         self._style_ttk()
         self._refresh_dict_list()
+
+        # keyboard shortcuts
+        self.bind_all("<Control-f>", lambda e: self.search_entry.focus_set())
+        self.bind_all("<Escape>",    lambda e: self._clear_filters())
 
         if not list_dictionaries():
             self._create_dict("My Vocabulary")
@@ -695,8 +984,12 @@ class App(tk.Tk):
             ("Clear Filters",        self._clear_filters),
         ])
         cascade("Tools", [
-            ("Start Quiz  練習",  self._open_quiz),
-            ("Dictionary Stats",  self._show_stats),
+            ("Start Quiz  練習",       self._open_quiz),
+            ("Dictionary Stats",       self._show_stats),
+            "---",
+            ("Manage Categories…",     self._manage_categories),
+            "---",
+            ("Export Filtered View…",  self._export_filtered_csv),
         ])
         cascade("Help", [("About", self._about)])
         self.config(menu=self.mb)
@@ -806,22 +1099,32 @@ class App(tk.Tk):
                  font=FONT_UI,
                  relief="flat", bd=0, width=22)
         self.search_entry.pack(side="left", ipady=1)
-
-        self.cat_lbl = lbl(self.toolbar_inner, "Category:", font=FONT_UIS)
-        self.cat_lbl.pack(side="left", padx=(14,4))
-        self.cat_filter_var = tk.StringVar(value="All")
-        self.cat_menu = ttk.OptionMenu(self.toolbar_inner, self.cat_filter_var, "All", "All",
-                                        command=lambda _: self._apply_filter())
-        self.cat_menu.pack(side="left")
+        # placeholder
+        self._search_placeholder("Type to search…")
+        # clear button
+        self.srch_clear = tk.Label(self.srch_frame, text="✕", cursor="hand2",
+                                    font=FONT_UIS, padx=4)
+        self.srch_clear.pack(side="left")
+        self.srch_clear.bind("<Button-1>", lambda e: (self.search_var.set(""), self._show_placeholder()))
 
         self.fav_var = tk.BooleanVar()
         self.fav_cb = tk.Checkbutton(self.toolbar_inner, text="⭐ Favourites",
                        variable=self.fav_var, command=self._apply_filter,
                        font=FONT_UIS)
-        self.fav_cb.pack(side="left", padx=14)
+        self.fav_cb.pack(side="left", padx=(14,0))
+
+        self.manage_cat_btn = FlatButton(self.toolbar_inner, "⚙ Categories",
+                   command=self._manage_categories, font=FONT_UIS, padx=10, pady=4)
+        self.manage_cat_btn.pack(side="left", padx=(10,0))
 
         self.count_lbl = lbl(self.toolbar_inner, "", font=FONT_UIS)
         self.count_lbl.pack(side="right")
+
+        # Category chips bar (sits below toolbar)
+        self.cat_bar = tk.Frame(self.main, highlightthickness=1)
+        self.cat_bar.pack(fill="x")
+        self.cat_chips_inner = tk.Frame(self.cat_bar)
+        self.cat_chips_inner.pack(fill="x", padx=10, pady=5)
 
         # Table
         self.tbl_frame = tk.Frame(self.main)
@@ -864,6 +1167,32 @@ class App(tk.Tk):
                  anchor="w", padx=14, pady=4)
         self.status_bar.pack(fill="x", side="bottom")
 
+    def _search_placeholder(self, text):
+        """Attach placeholder hint to search entry."""
+        self._ph_text = text
+        self._ph_active = False
+        self.search_entry.bind("<FocusIn>",  self._hide_placeholder)
+        self.search_entry.bind("<FocusOut>", self._show_placeholder)
+        self._show_placeholder()
+
+    def _show_placeholder(self, *_):
+        if not self.search_var.get():
+            self._ph_active = True
+            self.search_entry.config(fg=C["ink3"])
+            self.search_entry.delete(0, "end")
+            self.search_entry.insert(0, self._ph_text)
+
+    def _hide_placeholder(self, *_):
+        if self._ph_active:
+            self._ph_active = False
+            self.search_entry.config(fg=C["entry_fg"])
+            self.search_entry.delete(0, "end")
+
+    def _get_search_q(self):
+        if self._ph_active:
+            return ""
+        return self.search_var.get().lower()
+
     def _toggle_theme(self):
         self.dark_mode = not self.dark_mode
         C.clear()
@@ -886,7 +1215,6 @@ class App(tk.Tk):
         self.srch_frame.config(bg=C["entry_bg"], highlightbackground=C["bg3"])
         self.srch_lbl.config(fg=C["ink3"], bg=C["entry_bg"])
         self.search_entry.config(bg=C["entry_bg"], fg=C["entry_fg"], insertbackground=C["entry_fg"])
-        self.cat_lbl.config(fg=C["ink2"], bg=C["bg2"])
         self.fav_cb.config(bg=C["bg2"], fg=C["ink2"], selectcolor=C["bg3"], activebackground=C["bg2"])
         self.count_lbl.config(fg=C["ink3"], bg=C["bg2"])
         self.tbl_frame.config(bg=C["bg"])
@@ -910,6 +1238,12 @@ class App(tk.Tk):
             is_quiz = "Quiz" in btn.cget("text")
             btn.set_colors(C["sidebar2"], C["white"] if is_quiz else "#AAAACC", C["sidebar3"])
         
+        self.manage_cat_btn.set_colors(C["bg2"], C["ink2"], C["bg3"])
+        self.srch_clear.config(fg=C["ink3"], bg=C["entry_bg"])
+        self.cat_bar.config(bg=C["bg2"], highlightbackground=C["bg3"])
+        self.cat_chips_inner.config(bg=C["bg2"])
+        self._refresh_cat_chips()
+
         self.add_word_btn.set_colors(C["red"], C["white"], C["red2"])
         self.theme_btn.set_colors(C["bg2"], C["ink2"], C["bg3"])
         
@@ -1096,43 +1430,103 @@ class App(tk.Tk):
         m.add_command(label="Delete",             command=self._delete_selected)
         m.tk_popup(e.x_root, e.y_root)
 
-    # filter
+    # filter / chips
     def _refresh_cat_menu(self):
+        """Keep for compatibility; delegates to chip rebuild."""
+        self._refresh_cat_chips()
+
+    def _refresh_cat_chips(self):
+        """Rebuild the category chip buttons in the cat_bar."""
+        for w in self.cat_chips_inner.winfo_children():
+            w.destroy()
+        self._cat_chip_btns.clear()
+
         if not self.current_dict:
             return
-        cats = sorted({w.get("category","") for w in self.current_dict["words"] if w.get("category")})
-        opts = ["All"] + cats
-        m = self.cat_menu["menu"]
-        m.delete(0, "end")
-        for o in opts:
-            m.add_command(label=o,
-                          command=lambda v=o: (self.cat_filter_var.set(v), self._apply_filter()))
-        if self.cat_filter_var.get() not in opts:
-            self.cat_filter_var.set("All")
+
+        cats = sorted({w.get("category","") or "Uncategorized"
+                       for w in self.current_dict["words"]})
+        if not cats:
+            return
+
+        # counts per category
+        counts = {}
+        for w in self.current_dict["words"]:
+            c = w.get("category","") or "Uncategorized"
+            counts[c] = counts.get(c, 0) + 1
+
+        # "All" chip
+        all_active = len(self._selected_cats) == 0
+        all_chip = self._make_chip("All  (%d)" % len(self.current_dict["words"]),
+                                    active=all_active)
+        all_chip.pack(side="left", padx=(0,4))
+        all_chip.bind("<Button-1>", lambda e: self._chip_click(None))
+        self._cat_chip_btns["__all__"] = all_chip
+
+        sep_lbl = lbl(self.cat_chips_inner, "│", font=FONT_UIS, fg=C["bg3"], bg=C["bg2"])
+        sep_lbl.pack(side="left", padx=4)
+
+        for cat in cats:
+            active = cat in self._selected_cats
+            c_lbl  = f"{cat}  ({counts.get(cat,0)})"
+            chip   = self._make_chip(c_lbl, active=active)
+            chip.pack(side="left", padx=(0,4))
+            chip.bind("<Button-1>", lambda e, c=cat: self._chip_click(c))
+            self._cat_chip_btns[cat] = chip
+
+    def _make_chip(self, text, active=False):
+        bg  = C["red"]      if active else C["bg3"]
+        fg  = C["white"]    if active else C["ink2"]
+        hbg = C["red2"]     if active else C["bg2"]
+        chip = FlatButton(self.cat_chips_inner, text=text,
+                           bg=bg, fg=fg, hover_bg=hbg,
+                           font=FONT_UIS, padx=10, pady=3)
+        return chip
+
+    def _chip_click(self, cat):
+        """Toggle a category chip; cat=None means 'All'."""
+        if cat is None:
+            self._selected_cats.clear()
+        else:
+            if cat in self._selected_cats:
+                self._selected_cats.discard(cat)
+            else:
+                self._selected_cats.add(cat)
+        self._refresh_cat_chips()
+        self._apply_filter()
 
     def _filter_favourites(self):
         self.fav_var.set(True)
+        self._selected_cats.clear()
+        self._refresh_cat_chips()
         self._apply_filter()
 
     def _clear_filters(self):
-        self.search_var.set("")
-        self.cat_filter_var.set("All")
+        if self._ph_active:
+            pass
+        else:
+            self.search_var.set("")
+        self._show_placeholder()
+        self._selected_cats.clear()
         self.fav_var.set(False)
+        self._refresh_cat_chips()
         self._apply_filter()
 
     def _apply_filter(self, *_):
         if not self.current_dict:
             return
-        q     = self.search_var.get().lower()
-        cat_f = self.cat_filter_var.get()
+        q     = self._get_search_q()
         fav_f = self.fav_var.get()
 
         filtered = []
         for w in self.current_dict.get("words", []):
             if fav_f and not w.get("favorite"):
                 continue
-            if cat_f != "All" and w.get("category") != cat_f:
-                continue
+            # multi-cat filter
+            if self._selected_cats:
+                wcat = w.get("category","") or "Uncategorized"
+                if wcat not in self._selected_cats:
+                    continue
             if q:
                 q_norm = normalize_kana(q)
                 hay = normalize_kana(" ".join([w.get(k,"") for k in ("word","reading","romaji","comment","category")]).lower())
@@ -1175,6 +1569,19 @@ class App(tk.Tk):
             arrow = (" ▲" if not self._sort_rev else " ▼") if c == col else ""
             self.tree.heading(c, text=t + arrow)
 
+    # category management
+    def _manage_categories(self):
+        if not self.current_dict:
+            messagebox.showinfo("No dictionary", "Select a dictionary first.", parent=self)
+            return
+        dlg = CategoryManagerDialog(self, self.current_dict)
+        self.wait_window(dlg)
+        save_dict(self.current_dict)
+        self._selected_cats.clear()
+        self._refresh_cat_chips()
+        self._apply_filter()
+        self.status_var.set("Categories updated")
+
     # csv
     def _export_csv(self):
         if not self.current_dict:
@@ -1215,11 +1622,32 @@ class App(tk.Tk):
         self.status_var.set(f"Imported {count} words")
         messagebox.showinfo("Done", f"Imported {count} words.", parent=self)
 
+    def _export_filtered_csv(self):
+        if not self.current_dict:
+            messagebox.showinfo("No dictionary", "Select a dictionary first."); return
+        words = self.all_words
+        if not words:
+            messagebox.showinfo("Nothing to export", "No words match the current filters."); return
+        path = filedialog.asksaveasfilename(
+            defaultextension=".csv", filetypes=[("CSV","*.csv")],
+            initialfile=f"{self.current_dict['name']}_filtered.csv", parent=self)
+        if not path: return
+        fields = ["word","reading","romaji","category","comment","favorite","created"]
+        with open(path,"w",newline="",encoding="utf-8-sig") as f:
+            wr = csv.DictWriter(f, fieldnames=fields)
+            wr.writeheader()
+            for e in words:
+                wr.writerow({k: e.get(k,"") for k in fields})
+        self.status_var.set(f"Exported {len(words)} words to {path}")
+        messagebox.showinfo("Done", f"Exported {len(words)} words (filtered view).", parent=self)
+
     ## quiz stuff ##
     def _open_quiz(self):
         if not self.current_dict or not self.current_dict.get("words"):
             messagebox.showinfo("No words", "Add some words first!", parent=self); return
-        QuizWindow(self, self.current_dict["words"])
+        QuizWindow(self, self.current_dict["words"],
+                   categories=sorted({w.get("category","") or "Uncategorized"
+                                       for w in self.current_dict["words"]}))
 
     def _show_stats(self):
         if not self.current_dict:
