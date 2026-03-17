@@ -1,7 +1,7 @@
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog, filedialog
-import json, os, uuid, random, csv
-from datetime import datetime
+import json, os, uuid, random, csv, threading, urllib.request
+from datetime import datetime, timedelta
 from pathlib import Path
 
 # path
@@ -33,15 +33,15 @@ C_LIGHT = {
 }
 
 C_DARK = {
-    "bg":       "#111111",
-    "bg2":      "#1A1A1A",
-    "bg3":      "#252525",
-    "sidebar":  "#080808",
-    "sidebar2": "#0F0F0F",
-    "sidebar3": "#181818",
+    "bg":       "#0C0C0C",
+    "bg2":      "#131313",
+    "bg3":      "#1C1C1C",
+    "sidebar":  "#060606",
+    "sidebar2": "#0D0D0D",
+    "sidebar3": "#141414",
     "ink":      "#D0D0D0",
     "ink2":     "#9AAABB",
-    "ink3":     "#555555",
+    "ink3":     "#686870",   # lifted from #555555 so sidebar labels are legible
     "red":      "#C0392B",
     "red2":     "#E74C3C",
     "green":    "#6A8759",
@@ -49,10 +49,10 @@ C_DARK = {
     "blue":     "#4A76B2",
     "blue2":    "#3A7AB5",
     "white":    "#FFFFFF",
-    "sel":      "#1E3A5F",
-    "entry_bg": "#1A1A1A",
+    "sel":      "#162C4E",
+    "entry_bg": "#111111",
     "entry_fg": "#D0D0D0",
-    "alt_row":  "#161616",
+    "alt_row":  "#0F0F0F",
 }
 
 C = C_LIGHT.copy() # start with light mode
@@ -73,7 +73,6 @@ for _cjk in ["Yu Gothic UI","Meiryo UI","Hiragino Sans",
 # js read the names bro, you cannot be that lazy
 
 def normalize_kana(text):
-    """Normalize kana for search: converts katakana to hiragana so either script matches the other."""
     result = []
     for ch in text:
         code = ord(ch)
@@ -86,17 +85,504 @@ def normalize_kana(text):
 def _now():
     return datetime.now().strftime("%Y-%m-%d %H:%M")
 
+_SRS_INTERVALS = [0, 1, 2, 4, 8, 16]
+
+def srs_is_due(word):
+    due = word.get("srs_due", "")
+    if not due:
+        return True
+    try:
+        return datetime.now() >= datetime.strptime(due, "%Y-%m-%d %H:%M")
+    except Exception:
+        return True
+
+def srs_advance(word, correct):
+    """Update srs_level / srs_due on a word dict in-place after an answer."""
+    level = word.get("srs_level", 0)
+    if correct:
+        level = min(5, level + 1)
+    else:
+        level = max(0, level - 1)
+    days  = _SRS_INTERVALS[level]
+    due   = (datetime.now() + timedelta(days=days)).strftime("%Y-%m-%d %H:%M")
+    word["srs_level"] = level
+    word["srs_due"]   = due
+
+def srs_label(level):
+    return ["New", "Seen", "Learning", "Familiar", "Known", "Mastered"][level]
+
+#JLPT stuff (thank you wkei)
+JLPT_CACHE_PATH = DATA_DIR / "jlpt_cache.json"
+# REST API by wkei — https://github.com/wkei/jlpt-vocab-api (MIT)
+# level param: 5=N5, 4=N4, 3=N3, 2=N2, 1=N1
+_JLPT_API_URL = "https://jlpt-vocab-api.vercel.app/api/words/all?level={}"
+JLPT_LEVEL_NAMES = ["N5", "N4", "N3", "N2", "N1"]
+
+def load_jlpt_cache():
+    if JLPT_CACHE_PATH.exists():
+        try:
+            with open(JLPT_CACHE_PATH, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+def save_jlpt_cache(data):
+    with open(JLPT_CACHE_PATH, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+
+def fetch_jlpt_level(n, cache, on_done=None):
+    def _run():
+        try:
+            url = _JLPT_API_URL.format(n)
+            req = urllib.request.Request(url, headers={"User-Agent": "Wagacho/1.0"})
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+            raw_words = payload if isinstance(payload, list) else payload.get("words", [])
+            cleaned = []
+            for e in raw_words:
+                w = e.get("word","") or ""
+                r = e.get("furigana","") or e.get("reading","") or ""
+                m = e.get("meaning","") or ""
+                if w or r:
+                    cleaned.append({"word": w, "reading": r, "meaning": m})
+            level_key = f"N{n}"
+            cache[level_key] = cleaned
+            save_jlpt_cache(cache)
+            if on_done:
+                on_done(level_key, len(cleaned), None)
+        except Exception as exc:
+            if on_done:
+                on_done(f"N{n}", 0, str(exc))
+    threading.Thread(target=_run, daemon=True).start()
+
+def jlpt_lookup(word_entry, cache):
+    w = normalize_kana((word_entry.get("word","") or "").lower())
+    r = normalize_kana((word_entry.get("reading","") or "").lower())
+    for lvl in JLPT_LEVEL_NAMES:
+        for e in cache.get(lvl, []):
+            ew = normalize_kana((e.get("word","") or "").lower())
+            er = normalize_kana((e.get("reading","") or "").lower())
+            if (w and w == ew) or (r and r and r == er):
+                return lvl
+    return ""
+
+def get_exam_pool(user_words, jlpt_cache, level_key):
+    uw = {normalize_kana((w.get("word","") or "").lower()) for w in user_words}
+    ur = {normalize_kana((w.get("reading","") or "").lower()) for w in user_words}
+    pool = []
+    for e in jlpt_cache.get(level_key, []):
+        ew = normalize_kana((e.get("word","") or "").lower())
+        er = normalize_kana((e.get("reading","") or "").lower())
+        if (ew and ew in uw) or (er and er in ur):
+            pool.append(e)
+    return pool
+
+# static questions :D
+GRAMMAR_QUESTIONS = {
+"N5": [
+  {"sentence":"いつ 東京へ 行く ＿＿＿＿、おしえてください。",
+   "translation":"Please tell me _____ you are going to Tokyo.",
+   "options":["に","を","と","か"],
+   "answer":3,
+   "explanation":"か is the indirect-question particle meaning 'if/when'. It turns the clause into an embedded question. に marks time/direction, を marks objects, と marks quotation."},
+  {"sentence":"これ ＿＿＿＿ わたしの かばん です。",
+   "translation":"This _____ my bag.",
+   "options":["を","が","は","も"],
+   "answer":2,
+   "explanation":"は is the topic marker. It presents これ as the topic of the sentence. を marks direct objects, が marks grammatical subjects, も means 'also'."},
+  {"sentence":"まいにち がっこう ＿＿＿＿ いきます。",
+   "translation":"I go _____ school every day.",
+   "options":["を","で","へ","が"],
+   "answer":2,
+   "explanation":"へ marks the destination/direction of movement. に also works for destinations, but へ emphasises direction. で marks location of action, を marks objects."},
+  {"sentence":"ここ ＿＿＿＿ たばこを すわないでください。",
+   "translation":"Please do not smoke _____ here.",
+   "options":["に","で","へ","を"],
+   "answer":1,
+   "explanation":"で marks the location where an action takes place. に marks existence/destination rather than the location of an action."},
+  {"sentence":"あの みせ ＿＿＿＿ パンが やすいです。",
+   "translation":"The bread _____ that shop is cheap.",
+   "options":["が","で","の","を"],
+   "answer":2,
+   "explanation":"の connects two nouns showing belonging or origin: 'that shop's bread'. が marks subjects, で marks location of action."},
+  {"sentence":"にほんご ＿＿＿＿ はなせますか。",
+   "translation":"Can you speak _____ Japanese?",
+   "options":["が","を","で","に"],
+   "answer":0,
+   "explanation":"が marks the object of potential-form verbs like はなせる. を would mark the object of the plain form はなす. This is a key grammar distinction for ability expressions."},
+  {"sentence":"えき ＿＿＿＿ でて、みぎに まがってください。",
+   "translation":"Exit _____ the station and turn right.",
+   "options":["を","で","から","に"],
+   "answer":2,
+   "explanation":"から marks the starting point ('from the station'). を with movement verbs marks the space passed through, not the point of departure."},
+  {"sentence":"この えいがは とても おもしろい ＿＿＿＿。",
+   "translation":"This movie is very interesting _____ .",
+   "options":["ですか","でした","ですね","ではない"],
+   "answer":2,
+   "explanation":"ね seeks agreement from the listener ('isn't it?'). ですか forms a question, でした is past tense, ではない is negation."},
+  {"sentence":"あした ＿＿＿＿ テストが あります。",
+   "translation":"There is a test _____ tomorrow.",
+   "options":["に","で","から","は"],
+   "answer":0,
+   "explanation":"に marks specific points in time with days, dates, and clock times. Relative time expressions like あした sometimes omit に, but it's the most natural choice here."},
+  {"sentence":"バスで 一時間 ＿＿＿＿ かかります。",
+   "translation":"It takes _____ one hour by bus.",
+   "options":["が","を","は","ぐらい"],
+   "answer":3,
+   "explanation":"ぐらい/くらい expresses approximation: 'about / around one hour'. The other options are particles with different grammatical functions."},
+  {"sentence":"この りんごを ぜんぶ ＿＿＿＿ ください。",
+   "translation":"Please _____ all of these apples.",
+   "options":["たべて","たべる","たべた","たべに"],
+   "answer":0,
+   "explanation":"〜てください is the polite request form. It requires the て-form of the verb. たべる is plain present, たべた is plain past, たべに marks purpose of movement."},
+  {"sentence":"わたしは コーヒー ＿＿＿＿ こうちゃ ＿＿＿＿ すきです。",
+   "translation":"I like both coffee _____ tea.",
+   "options":["や / も","と / も","か / が","に / を"],
+   "answer":1,
+   "explanation":"と connects items in a complete list; も adds 'also/too'. Together they express 'I like A and I also like B'. や implies a non-exhaustive list."},
+],
+"N4": [
+  {"sentence":"もっと はやく はしれば、まにあった ＿＿＿＿。",
+   "translation":"If I had run faster, I would have made it _____ .",
+   "options":["のに","から","けど","ので"],
+   "answer":0,
+   "explanation":"のに after a conditional expresses regret or frustration about a contrary-to-fact outcome. から and ので express cause/reason, けど expresses contrast."},
+  {"sentence":"かれは びょうきな ＿＿＿＿、がっこうへ いきました。",
+   "translation":"Even _____ being sick, he went to school.",
+   "options":["から","ので","のに","ために"],
+   "answer":2,
+   "explanation":"のに (concession) means 'even though / despite'. から and ので express reason/cause. ために expresses purpose or cause of something that already happened."},
+  {"sentence":"あめが ふって ＿＿＿＿ でかけました。",
+   "translation":"We went out _____ even though it was raining.",
+   "options":["いても","いるから","いるので","いるけど"],
+   "answer":0,
+   "explanation":"〜ていても is the concessive conditional: 'even if/even though (it is happening)'. It combines て+いる+も for this meaning."},
+  {"sentence":"かいぎは 三時に はじまる ＿＿＿＿ です。",
+   "translation":"The meeting _____ start at 3 o'clock.",
+   "options":["はず","こと","もの","ため"],
+   "answer":0,
+   "explanation":"はずです expresses reasonable expectation based on known facts: 'it should / it is expected to'. ことです gives advice, ものです expresses generalisation."},
+  {"sentence":"くすりを のまない ＿＿＿＿、なおりませんよ。",
+   "translation":"If you don't take your medicine, you won't get better.",
+   "options":["なら","と","ては","から"],
+   "answer":2,
+   "explanation":"〜ては with a negative result means 'if you do X (bad thing), bad outcome follows'. It marks an undesirable conditional. なら is a topic-based conditional, と is a natural/inevitable conditional."},
+  {"sentence":"あの レストランは たかい ＿＿＿＿、おいしい です。",
+   "translation":"That restaurant is expensive, _____ the food is good.",
+   "options":["けど","ので","から","ために"],
+   "answer":0,
+   "explanation":"けど (=けれど) connects contrasting clauses: 'it's expensive, but it's good'. ので and から give a reason, ために expresses purpose."},
+  {"sentence":"かのじょに あう ＿＿＿＿ えきへ いきました。",
+   "translation":"I went to the station _____ meet her.",
+   "options":["ために","から","ので","けど"],
+   "answer":0,
+   "explanation":"〜ために with a dictionary-form verb expresses purpose: 'in order to do X'. から and ので state reasons for something that already happened, not future purpose."},
+  {"sentence":"この しごとは かのじょ ＿＿＿＿ できません。",
+   "translation":"This job _____ she cannot do.",
+   "options":["には","では","にも","でも"],
+   "answer":0,
+   "explanation":"には strengthens the topic with the nuance 'specifically for her'. では would refer to a location/situation context rather than a person."},
+  {"sentence":"＿＿＿＿ ほど、むずかしい しけんは ありません。",
+   "translation":"There is no exam _____ difficult as this one.",
+   "options":["これ","こんな","こう","この"],
+   "answer":0,
+   "explanation":"これほど = 'to this degree / as much as this'. こんな directly modifies a noun, こう is an adverb of manner. これほど is the set phrase for degree comparisons."},
+  {"sentence":"このまま にほんご ＿＿＿＿ べんきょうすれば、うまく なりますよ。",
+   "translation":"If you keep studying Japanese _____ like this, you will improve.",
+   "options":["だけ","ばかり","しか","も"],
+   "answer":1,
+   "explanation":"ばかり = 'nothing but / only (repeatedly)'. It implies excessive or habitual focus. だけ also means 'only' but lacks the habitual nuance. しか requires negation."},
+],
+"N3": [
+  {"sentence":"さいきん ねむれない ＿＿＿＿、びょういんへ いったほうがいいですよ。",
+   "translation":"Since you haven't been able to sleep lately _____ , you should see a doctor.",
+   "options":["ようで","らしくて","みたいで","なら"],
+   "answer":3,
+   "explanation":"なら (conditional) picks up information the speaker was just told and gives advice: 'If that's the case, then…'. ようで, らしくて, and みたいで all express appearance/hearsay, not advice conditions."},
+  {"sentence":"もう すこし ねだんが やすければ ＿＿＿＿。",
+   "translation":"If only the price were a little cheaper _____ .",
+   "options":["かもしれない","かったのに","のに","はずだ"],
+   "answer":2,
+   "explanation":"〜ければ〜のに expresses a counterfactual wish: 'if it were X (but it's not), that would be good'. のに alone at sentence-end expresses regret."},
+  {"sentence":"こんなに べんきょうした ＿＿＿＿、しっぱいするわけがない。",
+   "translation":"Having studied this much _____ , there is no way I will fail.",
+   "options":["からには","ものの","ところが","くせに"],
+   "answer":0,
+   "explanation":"からには = 'now that / since (I have committed to this action)'. It implies a logical consequence or obligation. ものの concedes a point, ところが introduces a surprising contrast."},
+  {"sentence":"彼女は いつも にこにこして ＿＿＿＿、実は なやみが あるらしい。",
+   "translation":"Even though she is always smiling _____ , she apparently has worries.",
+   "options":["いるのに","いるから","いるので","いるし"],
+   "answer":0,
+   "explanation":"〜ているのに expresses surprise or contrast: 'despite always smiling'. から and ので would make smiling the cause of her worries, which is the opposite meaning."},
+  {"sentence":"かれは いくら おこっても ＿＿＿＿ かわらない。",
+   "translation":"No matter how much he gets angry _____ , nothing changes.",
+   "options":["なにも","なんか","どうも","どうせ"],
+   "answer":0,
+   "explanation":"いくら〜ても、なにも〜ない = 'no matter how much…, nothing changes'. どうせ means 'anyway/regardless (with resignation)' and changes the meaning significantly."},
+  {"sentence":"しりょうを みた ＿＿＿＿、ほうこくしてください。",
+   "translation":"After reviewing the materials _____ , please submit your report.",
+   "options":["うえで","まえに","ために","ものの"],
+   "answer":0,
+   "explanation":"〜たうえで = 'after doing X, then do Y'. It states that Y must come after X is completed. まえに means 'before', ために means 'in order to'."},
+  {"sentence":"この くすりは いちにち ＿＿＿＿ 三回 のんでください。",
+   "translation":"Please take this medicine 3 times _____ day.",
+   "options":["あたり","ごとに","につき","だけ"],
+   "answer":2,
+   "explanation":"につき = 'per (unit)'. 一日につき三回 = '3 times per day'. It is the most precise and formal choice here. ごとに = 'every/each', あたり also means 'per' but is slightly less formal."},
+  {"sentence":"かれは ゆっくり はなした ＿＿＿＿、よく わからなかった。",
+   "translation":"Even though he spoke slowly _____ , I still didn't understand well.",
+   "options":["ものの","ものに","ものか","ものを"],
+   "answer":0,
+   "explanation":"〜たものの = 'although / even though (he did X)'. It introduces a result that contradicts expectations. ものか expresses strong negation, ものを expresses regret."},
+  {"sentence":"あの 店は ＿＿＿＿ ながら、なかなか おいしい。",
+   "translation":"Although that shop is _____ , it is actually quite good.",
+   "options":["やすい","やすく","やすさ","やすかっ"],
+   "answer":1,
+   "explanation":"〜ながら (concession) attaches to the adverbial form (く-form) of い-adjectives: やすく＋ながら = 'although cheap'. やすい is the plain form, やすさ is a noun."},
+  {"sentence":"試験に 合格する ＿＿＿＿、毎日 練習しています。",
+   "translation":"_____ pass the exam, I practice every day.",
+   "options":["ために","ように","ことに","からに"],
+   "answer":0,
+   "explanation":"〜ために with a volitional verb expresses purpose: 'in order to pass'. 〜ように is used when the goal is not directly controllable by the speaker."},
+],
+"N2": [
+  {"sentence":"プロジェクトの せいこうは チームワーク ＿＿＿＿ かかっている。",
+   "translation":"The success of the project _____ depends on teamwork.",
+   "options":["にかけて","にかかって","によって","にとって"],
+   "answer":1,
+   "explanation":"〜にかかっている = 'depends on X'. によって = 'depending on / by means of'. にとって = 'for (someone's perspective)'. にかけて means 'from X to Y' or 'in terms of'."},
+  {"sentence":"その けっか ＿＿＿＿、あらためて かいぎを ひらくことに なった。",
+   "translation":"_____ that result, it was decided to hold another meeting.",
+   "options":["をふまえて","をもとに","にもとづいて","をうけて"],
+   "answer":3,
+   "explanation":"〜をうけて = 'in response to / following on from'. をふまえて = 'taking into account'. をもとに = 'based on'. にもとづいて = 'based on (rules or evidence)'."},
+  {"sentence":"かれの はつげんは じじつ ＿＿＿＿ している。",
+   "translation":"His statement _____ contradicts the facts.",
+   "options":["に反","を反","と反","で反"],
+   "answer":0,
+   "explanation":"〜に反する is a set expression meaning 'to go against / contradict'. The correct particle is に. 事実に反する is the standard collocation."},
+  {"sentence":"しめきりが ちかい ＿＿＿＿、まだ ぜんぜん できていない。",
+   "translation":"Even though the deadline is close _____ , I have not done anything yet.",
+   "options":["というのに","というのは","というより","というか"],
+   "answer":0,
+   "explanation":"〜というのに = 'even though / despite the fact that'. It expresses indignation or surprise at a stark contrast. というのは introduces a definition/explanation."},
+  {"sentence":"けいかくを かえる ＿＿＿＿ じかんが なかった。",
+   "translation":"There was no time _____ change the plan.",
+   "options":["にあたって","にさいして","いじょう","いとまも"],
+   "answer":3,
+   "explanation":"〜いとまもない = 'not even the time/leisure to do X'. It expresses extreme time pressure. にあたって/にさいして = 'on the occasion of', which has a completely different meaning."},
+  {"sentence":"かれが そんな ことを いう ＿＿＿＿ ない。",
+   "translation":"There is no way _____ he would say something like that.",
+   "options":["はずが","わけが","ことが","ものが"],
+   "answer":0,
+   "explanation":"〜はずがない = 'there is no way / it cannot be'. It negates a logical expectation. わけがない also means 'no reason to', but はずがない specifically denies what was expected."},
+  {"sentence":"彼女は ピアノが うまい ＿＿＿＿、えいごも ぺらぺらだ。",
+   "translation":"On top of being good at piano _____ , she also speaks English fluently.",
+   "options":["うえに","ほかに","だけで","くせに"],
+   "answer":0,
+   "explanation":"〜うえに = 'in addition to / on top of that'. It stacks qualities in the same direction. ほかに = 'besides that (separate item)'. くせに has a critical/accusatory nuance."},
+  {"sentence":"その はなしは ほんとうか どうか ＿＿＿＿。",
+   "translation":"Whether that story is true or not _____ .",
+   "options":["わかりかねます","わかりにくい","わかりようがない","わかりづらい"],
+   "answer":0,
+   "explanation":"〜かねます is a formal, polite expression of inability: 'I am unable to say / I cannot determine'. わかりにくい means 'hard to understand', わかりようがない means 'no way of knowing'."},
+  {"sentence":"どんなに つかれていても、しごとを ＿＿＿＿ わけには いかない。",
+   "translation":"No matter how tired I am, I cannot _____ just quit the job.",
+   "options":["やめる","やめた","やめて","やめよう"],
+   "answer":0,
+   "explanation":"〜わけにはいかない uses the dictionary form of the verb: やめる＋わけにはいかない = 'I cannot simply quit'. It expresses that social/moral pressure makes an action impossible."},
+  {"sentence":"この けんきゅうは ＿＿＿＿ に たる せいかだ。",
+   "translation":"This research is a result worthy _____ of recognition.",
+   "options":["みとめる","みとめられる","みとめ","みとめよう"],
+   "answer":2,
+   "explanation":"〜に足る (にたる) = 'worthy of / sufficient for'. It attaches to the conjunctive (連用形/stem) form of the verb: みとめ＋に足る. Using the stem みとめ is the grammatically correct connection."},
+],
+}
+GRAMMAR_TEMPLATES = {
+"N5": [
+  {"template":"{W} ＿＿＿＿ いきます。",
+   "translation":"I go to {M}.",
+   "options":["に","を","で","が"],"answer":0,
+   "explanation":"に marks the destination of movement verbs like いく、くる、かえる."},
+  {"template":"まいにち {W} ＿＿＿＿ べんきょうします。",
+   "translation":"I study {M} every day.",
+   "options":["で","に","を","が"],"answer":2,
+   "explanation":"を marks the direct object of action verbs like べんきょうする、たべる、のむ."},
+  {"template":"{W} ＿＿＿＿ たべたいです。",
+   "translation":"I want to eat {M}.",
+   "options":["は","が","を","に"],"answer":2,
+   "explanation":"〜たい (want to) takes を for its object, just like the plain form of the verb."},
+  {"template":"あの {W} ＿＿＿＿ きれいです ね。",
+   "translation":"That {M} is beautiful, isn't it.",
+   "options":["が","は","を","で"],"answer":1,
+   "explanation":"は is the topic marker. It presents the noun as what the sentence is about."},
+  {"template":"{W} ＿＿＿＿ ありません。",
+   "translation":"There is no {M}.",
+   "options":["は","が","を","に"],"answer":1,
+   "explanation":"が marks the subject of existence verbs ある and いる. ありません is the negative."},
+  {"template":"これは {W} ＿＿＿＿ ほんです。",
+   "translation":"This is a book about {M}.",
+   "options":["の","を","に","が"],"answer":0,
+   "explanation":"の connects two nouns showing relationship: '{W}の本' = 'book of/about {W}'."},
+  {"template":"{W} ＿＿＿＿ すきですか？",
+   "translation":"Do you like {M}?",
+   "options":["が","を","に","は"],"answer":0,
+   "explanation":"すき (like) and きらい (dislike) take が for their object."},
+  {"template":"{W} を ＿＿＿＿ ください。",
+   "translation":"Please show me {M}.",
+   "options":["みせて","みせる","みせた","みせに"],"answer":0,
+   "explanation":"〜てください is the polite request form. It requires the て-form of the verb."},
+  {"template":"きのう {W} ＿＿＿＿ かいました。",
+   "translation":"Yesterday I bought {M}.",
+   "options":["を","が","は","で"],"answer":0,
+   "explanation":"を marks the direct object. かう (to buy) takes を."},
+  {"template":"{W} は ＿＿＿＿ です。",
+   "translation":"{M} is expensive.",
+   "options":["たかい","たかく","たかさ","たかかった"],"answer":0,
+   "explanation":"Adjective + です is the polite predicate form. い-adjectives keep their い before です."},
+],
+"N4": [
+  {"template":"{W} に なれる ＿＿＿＿、もっと べんきょうします。",
+   "translation":"In order to become good at {M}, I will study more.",
+   "options":["ために","ように","ことに","からに"],"answer":1,
+   "explanation":"〜ように with a potential verb expresses a goal that isn't directly controllable. 〜ために is used when the subject is the same and the goal is volitional."},
+  {"template":"{W} が できる ＿＿＿＿ なりました。",
+   "translation":"I have become able to do {M}.",
+   "options":["ように","ために","ことに","ながら"],"answer":0,
+   "explanation":"〜ようになる expresses a change of state: 'came to be able to'. It is used with potential forms to show a new ability."},
+  {"template":"{W} を している ＿＿＿＿ に、友達が 来た。",
+   "translation":"While I was doing {M}, a friend came.",
+   "options":["あいだ","まえ","あと","とき"],"answer":3,
+   "explanation":"〜ているときに = 'while doing / at the time of doing'. あいだ implies a continuous background action, ときに can be either a point in time or a period."},
+  {"template":"{W} を 見た ＿＿＿＿ が あります。",
+   "translation":"I have had the experience of seeing {M}.",
+   "options":["こと","もの","はず","わけ"],"answer":0,
+   "explanation":"〜たことがある expresses past experience: 'have done / have seen X before'. こと nominalises the verb phrase."},
+  {"template":"{W} は ＿＿＿＿ そうです。",
+   "translation":"{M} looks delicious.",
+   "options":["おいしい","おいしく","おいしさ","おいし"],"answer":3,
+   "explanation":"〜そうだ (appearance) attaches to the い-adjective stem (remove い): おいし＋そう. This is different from the い-form used before です."},
+  {"template":"友達に {W} を ＿＿＿＿ もらいました。",
+   "translation":"I had my friend do {M} for me.",
+   "options":["して","した","する","しよう"],"answer":0,
+   "explanation":"〜てもらう = 'receive the favour of someone doing X'. It requires the て-form before もらう."},
+  {"template":"{W} を ＿＿＿＿ ほうが いいです。",
+   "translation":"You should {M}.",
+   "options":["した","する","して","しよう"],"answer":0,
+   "explanation":"〜たほうがいい gives advice. It uses the past (た) form of the verb, not the dictionary form."},
+  {"template":"{W} が ＿＿＿＿ なら、ここに おいてください。",
+   "translation":"If you don't need {M}, please leave it here.",
+   "options":["いらない","いらなく","いらなかった","いらなくて"],"answer":0,
+   "explanation":"〜なら is a conditional that picks up on a stated or assumed situation. It takes the plain form of the predicate before it."},
+],
+"N3": [
+  {"template":"{W} を 終えた ＿＿＿＿、連絡してください。",
+   "translation":"After you have finished {M}, please get in touch.",
+   "options":["うえで","まえに","あとで","ために"],"answer":0,
+   "explanation":"〜たうえで = 'after completing X, then do Y'. It emphasises that the second action must follow completion of the first."},
+  {"template":"この {W} は ＿＿＿＿ にくい。",
+   "translation":"This {M} is hard to use.",
+   "options":["つかい","つかう","つかって","つかわれ"],"answer":0,
+   "explanation":"〜にくい attaches to the conjunctive/stem form of a verb (連用形): つかい＋にくい = 'hard to use'. Similarly, やすい attaches the same way."},
+  {"template":"{W} に ＿＿＿＿ かかわらず、参加してください。",
+   "translation":"Regardless of {M}, please participate.",
+   "options":["かかわらず","もかかわらず","かかわって","かかわる"],"answer":1,
+   "explanation":"〜にもかかわらず = 'despite / regardless of'. The も is part of the set expression. Without も, the grammar is slightly different."},
+  {"template":"{W} は ＿＿＿＿ つつある。",
+   "translation":"{M} is gradually changing.",
+   "options":["かわり","かわる","かわって","かわった"],"answer":0,
+   "explanation":"〜つつある = 'is in the process of / is gradually doing'. It attaches to the stem (連用形) of the verb: かわり＋つつある."},
+  {"template":"{W} に ＿＿＿＿ あたって、準備しましょう。",
+   "translation":"In preparation for {M}, let's get ready.",
+   "options":["あたって","むけて","かけて","よって"],"answer":1,
+   "explanation":"〜にむけて = 'towards / in preparation for (a goal or event)'. にあたって = 'on the occasion of (doing something)'."},
+  {"template":"{W} を した ＿＿＿＿ で、疲れました。",
+   "translation":"I got tired _____ of doing {M}.",
+   "options":["せい","おかげ","ため","わけ"],"answer":0,
+   "explanation":"〜せいで = 'because of (negative cause)'. It assigns blame. おかげで is positive ('thanks to'), ため is neutral purpose or reason."},
+],
+"N2": [
+  {"template":"{W} を ＿＿＿＿ にたる 実力がある。",
+   "translation":"I have the ability worthy of {M}.",
+   "options":["こなし","こなす","こなせ","こなして"],"answer":0,
+   "explanation":"〜に足る (にたる) attaches to the stem (連用形) of the verb: こなし＋に足る. This formal expression means 'sufficient to / worthy of'."},
+  {"template":"{W} に ＿＿＿＿、準備を 進めた。",
+   "translation":"In anticipation of {M}, we moved forward with preparations.",
+   "options":["そなえて","むけて","あたって","かかわって"],"answer":0,
+   "explanation":"〜にそなえて = 'in preparation for / in anticipation of'. むけて focuses on direction/goal, あたって is used for formal events/actions."},
+  {"template":"{W} を ＿＿＿＿ かねない。",
+   "translation":"This could potentially cause {M}.",
+   "options":["まねき","まねく","まねいて","まねかれ"],"answer":0,
+   "explanation":"〜かねない = 'could easily result in (an undesirable outcome)'. It attaches to the stem (連用形) of the verb: まねき＋かねない."},
+  {"template":"その {W} は ＿＿＿＿ にすぎない。",
+   "translation":"That {M} is nothing more than a temporary measure.",
+   "options":["一時的","一時的な","一時的に","一時的で"],"answer":2,
+   "explanation":"〜にすぎない = 'nothing more than / merely'. When used with a noun or adjectival noun, the に-form (adverbial) is required: 一時的に＋すぎない."},
+  {"template":"{W} の 問題は ＿＿＿＿ をえない。",
+   "translation":"The problem of {M} is unavoidable.",
+   "options":["みとめ","みとめる","みとめて","みとめた"],"answer":0,
+   "explanation":"〜をえない = 'cannot but / cannot help but (do)'. It is a formal, literary pattern that attaches to the stem (連用形)."},
+],
+}
+
+import copy as _copy
+
+def get_grammar_questions(level_key):
+    return _copy.deepcopy(GRAMMAR_QUESTIONS.get(level_key, []))
+
+def build_template_questions(level_key, user_words, max_q=20):
+    templates = GRAMMAR_TEMPLATES.get(level_key, [])
+    if not templates or not user_words:
+        return []
+
+    usable = [w for w in user_words if w.get("word","").strip()]
+    if not usable:
+        return []
+
+    result = []
+    random.shuffle(templates)
+    attempts = 0
+    while len(result) < max_q and attempts < max_q * 4:
+        attempts += 1
+        tmpl = random.choice(templates)
+        word = random.choice(usable)
+        w_str = word.get("word","") or ""
+        r_str = word.get("reading","") or w_str
+        m_str = word.get("comment","") or word.get("romaji","") or r_str
+
+        sentence    = tmpl["template"].replace("{W}", w_str).replace("{R}", r_str).replace("{M}", m_str)
+        translation = tmpl["translation"].replace("{W}", w_str).replace("{R}", r_str).replace("{M}", m_str)
+
+        result.append({
+            "sentence":    sentence,
+            "translation": translation,
+            "options":     list(tmpl["options"]),
+            "answer":      tmpl["answer"],
+            "explanation": tmpl.get("explanation",""),
+            "_from_template": True,
+        })
+
+    return result
+
+
+
 def dict_path(name):
     return DATA_DIR / f"{name}.json"
 
 def list_dictionaries():
-    return sorted(p.stem for p in DATA_DIR.glob("*.json"))
+    return sorted(p.stem for p in DATA_DIR.glob("*.json") if p.stem != "jlpt_cache")
 
 def load_dict(name):
     p = dict_path(name)
     if p.exists():
         with open(p, "r", encoding="utf-8") as f:
-            return json.load(f)
+            d = json.load(f)
+            if "name" not in d:       d["name"] = name
+            if "created" not in d:    d["created"] = _now()
+            if "categories" not in d: d["categories"] = ["Uncategorized"]
+            if "words" not in d:      d["words"] = []
+            return d
     return {"name": name, "created": _now(), "categories": ["Uncategorized"], "words": []}
 
 def save_dict(data):
@@ -278,7 +764,6 @@ class WordDialog(tk.Toplevel):
                      fieldbackground=C["entry_bg"], background=C["entry_bg"],
                      foreground=C["entry_fg"], selectbackground=C["sel"],
                      bordercolor=C["bg3"], arrowcolor=C["ink2"])
-        # This is needed to apply style to this specific window
         self.cat_cb.config(style="TCombobox")
 
     def _new_cat(self):
@@ -313,185 +798,301 @@ class WordDialog(tk.Toplevel):
         self.geometry(f"{w}x{h}+{px+pw//2-w//2}+{py+ph//2-h//2}")
 
 
-# quiz
 class QuizWindow(tk.Toplevel):
     MODES = {
-        "Word → Reading (kana)":  ("word",    "reading"),
+        "Word → Reading":         ("word",    "reading"),
         "Reading → Word":         ("reading", "word"),
         "Word → Romaji":          ("word",    "romaji"),
         "Romaji → Word":          ("romaji",  "word"),
         "Word → Meaning/Comment": ("word",    "comment"),
     }
+    TIMER_OPTS = [0, 5, 10, 15, 20]   # 0 = off
 
     def __init__(self, parent, words, categories=None):
         super().__init__(parent)
         self.title("練習 — Quiz")
-        self.geometry("520x600")
+        self.geometry("560x620")
+        self.minsize(480, 520)
         self.resizable(True, True)
         self.after(50, lambda: _safe_grab(self))
 
-        self.all_words  = [w for w in words if w.get("word")]
-        self.categories = ["All Categories"] + sorted(categories or [])
-        self.words   = self.all_words.copy()
-        self.deck    = []
-        self.idx     = 0
-        self.correct = 0
-        self.wrong   = 0
+        self.parent_app    = parent
+        self.all_words     = [w for w in words if w.get("word")]
+        self.categories    = ["All Categories"] + sorted(categories or [])
+        self.words         = self.all_words.copy()
+        self.deck          = []
+        self.idx           = 0
+        self.correct       = 0
+        self.wrong         = 0
+        self._timer_job    = None
+        self._time_left    = 0
+        self._phase        = "setup"   # setup | quiz | results
 
-        self.build_ui()
+        self._build_skeleton()
         self.update_theme()
+        self._show_setup()
 
-        if not self.all_words:
-            lbl(self, "No words to quiz!", fg=C["ink2"]).pack(expand=True)
-            self.card.pack_forget()
-            return
-        
-        self._new_deck()
-
-    def build_ui(self):
-        self.top = tk.Frame(self)
-        self.top.pack(fill="x")
-        self.top_lbl = lbl(self.top, "練習  Quiz Mode", font=FONT_H2,
-            fg=C["white"])
-        self.top_lbl.pack(side="left", padx=16, pady=12)
-        self.score_lbl = lbl(self.top, "✓ 0   ✗ 0",
-                              font=FONT_UIS, fg=C["ink3"])
+    def _build_skeleton(self):
+        self.hdr = tk.Frame(self)
+        self.hdr.pack(fill="x")
+        self.hdr_lbl = lbl(self.hdr, "練習  Quiz", font=FONT_H2, fg=C["white"])
+        self.hdr_lbl.pack(side="left", padx=16, pady=12)
+        self.score_lbl = lbl(self.hdr, "", font=FONT_UIS, fg=C["ink3"])
         self.score_lbl.pack(side="right", padx=16)
 
-        self.mode_row = tk.Frame(self, padx=16, pady=8)
-        self.mode_row.pack(fill="x")
-        self.mode_lbl = lbl(self.mode_row, "Mode:", font=FONT_UIS, fg=C["ink2"])
-        self.mode_lbl.pack(side="left")
-        self.mode_var = tk.StringVar(value=list(self.MODES)[0])
+        self.sep0 = sep(self)
+        self.sep0.pack(fill="x")
+
+        self.content = tk.Frame(self)
+        self.content.pack(fill="both", expand=True)
+
+    def _clear_content(self):
+        for w in self.content.winfo_children():
+            w.destroy()
+
+    def _show_setup(self):
+        self._cancel_timer()
+        self._phase = "setup"
+        self._clear_content()
+        self.score_lbl.config(text="")
+
+        pad = tk.Frame(self.content)
+        pad.pack(fill="both", expand=True, padx=28, pady=16)
+        pad.config(bg=C["bg"])
+
+        def section(title):
+            lbl(pad, title, font=FONT_UIB, fg=C["ink2"], bg=C["bg"]).pack(anchor="w", pady=(14,4))
+            sep(pad).pack(fill="x", pady=(0,8))
+
+        section("Quiz Mode")
+        self._mode_var = tk.StringVar(value=list(self.MODES)[0])
+        mode_row = tk.Frame(pad, bg=C["bg"])
+        mode_row.pack(fill="x")
+        self._mode_btns = {}
+        for m in self.MODES:
+            short = m.replace(" (kana)", "")
+            b = FlatButton(mode_row, short, font=FONT_UIS, padx=8, pady=4,
+                           command=lambda mv=m: self._sel_mode(mv))
+            b.pack(side="left", padx=(0,5))
+            self._mode_btns[m] = b
+        self._sel_mode(list(self.MODES)[0])
+
+        section("Answer Format")
+        self._fmt_var = tk.StringVar(value="type")
+        fmt_row = tk.Frame(pad, bg=C["bg"])
+        fmt_row.pack(fill="x")
+        self._fmt_btns = {}
+        for key, label in [("type","✏  Type-in"), ("mc","☑  Multiple Choice")]:
+            b = FlatButton(fmt_row, label, font=FONT_UIS, padx=12, pady=5,
+                           command=lambda k=key: self._sel_fmt(k))
+            b.pack(side="left", padx=(0,8))
+            self._fmt_btns[key] = b
+        self._sel_fmt("type")
+
+        section("Timer per Card")
+        self._timer_var = tk.IntVar(value=0)
+        tmr_row = tk.Frame(pad, bg=C["bg"])
+        tmr_row.pack(fill="x")
+        self._tmr_btns = {}
+        for t in self.TIMER_OPTS:
+            lbl_text = "Off" if t == 0 else f"{t}s"
+            b = FlatButton(tmr_row, lbl_text, font=FONT_UIS, padx=10, pady=5,
+                           command=lambda tv=t: self._sel_timer(tv))
+            b.pack(side="left", padx=(0,5))
+            self._tmr_btns[t] = b
+        self._sel_timer(0)
+
+        section("Deck")
+        deck_row = tk.Frame(pad, bg=C["bg"])
+        deck_row.pack(fill="x")
+        self._srs_var = tk.BooleanVar(value=False)
+
+        due_count = sum(1 for w in self.all_words if srs_is_due(w))
+        srs_text   = f"SRS Due Only  ({due_count} due)"
+        self._deck_btns = {}
+        for key, label in [("all","All Words"), ("srs", srs_text)]:
+            b = FlatButton(deck_row, label, font=FONT_UIS, padx=10, pady=5,
+                           command=lambda k=key: self._sel_deck(k))
+            b.pack(side="left", padx=(0,8))
+            self._deck_btns[key] = b
+        self._sel_deck("all")
+
+        lbl(pad, "Category", font=FONT_UIB, fg=C["ink2"], bg=C["bg"]).pack(anchor="w", pady=(14,4))
+        sep(pad).pack(fill="x", pady=(0,8))
+        self._setup_cat_var = tk.StringVar(value="All Categories")
+        cat_row = tk.Frame(pad, bg=C["bg"])
+        cat_row.pack(fill="x")
+        cat_menu = ttk.OptionMenu(cat_row, self._setup_cat_var,
+                                  "All Categories", *self.categories)
+        cat_menu.pack(side="left")
+        self._setup_cat_menu = cat_menu
+
+        btn_row = tk.Frame(pad, bg=C["bg"])
+        btn_row.pack(fill="x", pady=(20, 0))
+        start_btn = FlatButton(btn_row, "Start Quiz  →", command=self._start_quiz, pady=8, padx=18)
+        start_btn.set_colors(C["red"], C["white"], C["red2"])
+        start_btn.pack(side="right")
+
+        if not self.all_words:
+            lbl(pad, "⚠  No words to quiz. Add some first!", fg=C["red2"], bg=C["bg"],
+                font=FONT_UIS).pack(anchor="w", pady=8)
+            start_btn.config(state="disabled")
+
+        self.update_theme()
+
+    def _sel_mode(self, mode):
+        self._mode_var.set(mode)
+        for m, b in self._mode_btns.items():
+            b.set_colors(C["red"] if m == mode else C["bg3"],
+                         C["white"] if m == mode else C["ink2"],
+                         C["red2"] if m == mode else C["bg2"])
+
+    def _sel_fmt(self, key):
+        self._fmt_var.set(key)
+        for k, b in self._fmt_btns.items():
+            b.set_colors(C["blue"] if k == key else C["bg3"],
+                         C["white"] if k == key else C["ink2"],
+                         C["blue2"] if k == key else C["bg2"])
+
+    def _sel_timer(self, t):
+        self._timer_var.set(t)
+        for tv, b in self._tmr_btns.items():
+            b.set_colors(C["gold"] if tv == t else C["bg3"],
+                         C["sidebar"] if tv == t else C["ink2"],
+                         C["gold"] if tv == t else C["bg2"])
+
+    def _sel_deck(self, key):
+        self._deck_key = key
+        for k, b in self._deck_btns.items():
+            b.set_colors(C["blue"] if k == key else C["bg3"],
+                         C["white"] if k == key else C["ink2"],
+                         C["blue2"] if k == key else C["bg2"])
+
+    def _start_quiz(self):
+        cat = self._setup_cat_var.get()
+        if cat == "All Categories":
+            self.words = self.all_words.copy()
+        else:
+            self.words = [w for w in self.all_words
+                          if (w.get("category","") or "Uncategorized") == cat]
+        if self._deck_key == "srs":
+            due = [w for w in self.words if srs_is_due(w)]
+            self.words = due if due else self.words   # fall back to all if none due
+
+        if not self.words:
+            messagebox.showinfo("No words", "No words match that selection.", parent=self)
+            return
+
+        self.idx = self.correct = self.wrong = 0
+        self._phase = "quiz"
+        self._build_quiz_ui()
+        self._new_deck()
+
+    def _build_quiz_ui(self):
+        self._clear_content()
+        c = self.content
+        c.config(bg=C["bg"])
+
+        ctrl = tk.Frame(c, bg=C["bg2"])
+        ctrl.pack(fill="x")
+        ctrl_inner = tk.Frame(ctrl, bg=C["bg2"])
+        ctrl_inner.pack(fill="x", padx=12, pady=6)
+
+        self.mode_lbl2 = lbl(ctrl_inner, "Mode:", font=FONT_UIS, fg=C["ink2"], bg=C["bg2"])
+        self.mode_lbl2.pack(side="left")
+        self.mode_var2 = tk.StringVar(value=self._mode_var.get())
         modes = list(self.MODES.keys())
-        self.mode_menu = ttk.OptionMenu(self.mode_row, self.mode_var, modes[0], *modes,
-                       command=lambda _: self._new_deck())
-        self.mode_menu.pack(side="left", padx=8)
-        self.restart_btn = FlatButton(self.mode_row, "↺ Restart", command=self._new_deck,
-                   font=FONT_UIS, padx=10, pady=4)
+        self.mode_menu2 = ttk.OptionMenu(ctrl_inner, self.mode_var2, self.mode_var2.get(),
+                                          *modes, command=lambda _: self._new_deck())
+        self.mode_menu2.pack(side="left", padx=(4,12))
+
+        self.restart_btn = FlatButton(ctrl_inner, "↺  Restart", command=self._new_deck,
+                                       font=FONT_UIS, padx=10, pady=4)
         self.restart_btn.pack(side="right")
+        self.setup_btn = FlatButton(ctrl_inner, "⚙  Setup", command=self._show_setup,
+                                     font=FONT_UIS, padx=10, pady=4)
+        self.setup_btn.pack(side="right", padx=(0,6))
+        self.deck_lbl = lbl(ctrl_inner, "", font=FONT_UIS, fg=C["ink3"], bg=C["bg2"])
+        self.deck_lbl.pack(side="right", padx=(0,8))
 
-        self.cat_row = tk.Frame(self, padx=16, pady=4)
-        self.cat_row.pack(fill="x")
-        self.cat_lbl_q = lbl(self.cat_row, "Category:", font=FONT_UIS, fg=C["ink2"])
-        self.cat_lbl_q.pack(side="left")
-        self.quiz_cat_var = tk.StringVar(value="All Categories")
-        self.quiz_cat_menu = ttk.OptionMenu(self.cat_row, self.quiz_cat_var,
-                                             "All Categories", *self.categories,
-                                             command=lambda _: self._apply_cat_filter())
-        self.quiz_cat_menu.pack(side="left", padx=8)
-        self.deck_lbl = lbl(self.cat_row, "", font=FONT_UIS, fg=C["ink3"])
-        self.deck_lbl.pack(side="right")
+        sep(c).pack(fill="x")
 
-        self.sep = sep(self)
-        self.sep.pack(fill="x")
-
-        self.card = tk.Frame(self)
-        self.card.pack(fill="both", expand=True, padx=32, pady=16)
+        self.card = tk.Frame(c, bg=C["bg"])
+        self.card.pack(fill="both", expand=True, padx=28, pady=12)
         self._build_card_widgets()
 
     def _build_card_widgets(self):
-        self.progress_lbl = lbl(self.card, "", font=FONT_UIS, fg=C["ink3"])
-        self.progress_lbl.pack(anchor="e")
-
-        self.prompt_lbl = lbl(self.card, "", font=FONT_UIS, fg=C["ink2"])
-        self.prompt_lbl.pack(pady=(10,4))
-
-        self.q_box = tk.Frame(self.card, highlightthickness=1)
-        self.q_box.pack(fill="x", pady=(0,18), ipady=16, ipadx=12)
-        self.q_lbl = lbl(self.q_box, "", font=FONT_JPLG, fg=C["ink"])
-        self.q_lbl.pack()
-
-        self.ans_lbl = lbl(self.card, "Type your answer:", font=FONT_UIS, fg=C["ink2"])
-        self.ans_lbl.pack(anchor="w")
-        self.ans_row = tk.Frame(self.card)
-        self.ans_row.pack(fill="x", pady=(2,0))
-
-        self.ans_var = tk.StringVar()
-        self.ans_entry = tk.Entry(self.ans_row, textvariable=self.ans_var,
-                                   font=FONT_JP, relief="flat", bd=0,
-                                   highlightthickness=2)
-        self.ans_entry.pack(side="left", fill="x", expand=True, ipady=8)
-        self.ans_entry.bind("<Return>", lambda e: self._check())
-
-        self.check_btn = FlatButton(self.ans_row, "Check →", command=self._check,
-                                     padx=14, pady=8)
-        self.check_btn.pack(side="left", padx=(8,0))
-
-        self.fb_frame = tk.Frame(self.card)
-        self.fb_frame.pack(fill="x", pady=(14,0))
-        self.fb_icon = lbl(self.fb_frame, "", font=("Segoe UI", 22), fg=C["ink"])
-        self.fb_icon.pack()
-        self.fb_lbl  = lbl(self.fb_frame, "", font=FONT_JP, fg=C["ink2"])
-        self.fb_lbl.pack()
-        self.fb_hint = lbl(self.fb_frame, "", font=FONT_UIS, fg=C["ink3"])
-        self.fb_hint.pack()
-
-        self.next_btn = FlatButton(self.card, "Next  →", 
-                                    padx=16, pady=8, command=self._next_card)
-    
-    def update_theme(self):
-        self.configure(bg=C["bg"])
-        self.top.config(bg=C["sidebar"])
-        self.top_lbl.config(bg=C["sidebar"])
-        self.score_lbl.config(bg=C["sidebar"], fg=C["ink3"])
-        self.mode_row.config(bg=C["bg2"])
-        self.mode_lbl.config(bg=C["bg2"], fg=C["ink2"])
-        self.restart_btn.set_colors(bg=C["bg3"], fg=C["ink2"], hover_bg=C["bg2"])
-        self.cat_row.config(bg=C["bg2"])
-        self.cat_lbl_q.config(bg=C["bg2"], fg=C["ink2"])
-        self.deck_lbl.config(bg=C["bg2"], fg=C["ink3"])
-        self.sep.config(bg=C["bg3"])
-        self.card.config(bg=C["bg"])
-        self.progress_lbl.config(bg=C["bg"], fg=C["ink3"])
-        self.prompt_lbl.config(bg=C["bg"], fg=C["ink2"])
-        self.q_box.config(bg=C["bg2"], highlightbackground=C["bg3"])
-        self.q_lbl.config(bg=C["bg2"], fg=C["ink"])
-        self.ans_lbl.config(bg=C["bg"], fg=C["ink2"])
-        self.ans_row.config(bg=C["bg"])
-        self.ans_entry.config(bg=C["entry_bg"], fg=C["entry_fg"], insertbackground=C["entry_fg"],
-                              highlightbackground=C["bg3"], highlightcolor=C["red"])
-        self.check_btn.set_colors(bg=C["red"], fg=C["white"], hover_bg=C["red2"])
-        self.fb_frame.config(bg=C["bg"])
-        self.fb_icon.config(bg=C["bg"])
-        self.fb_lbl.config(bg=C["bg"])
-        self.fb_hint.config(bg=C["bg"], fg=C["ink3"])
-        self.next_btn.set_colors(bg=C["blue"], fg=C["white"], hover_bg=C["blue2"])
-
-    def _apply_cat_filter(self):
-        sel = self.quiz_cat_var.get()
-        if sel == "All Categories":
-            self.words = self.all_words.copy()
-        else:
-            self.words = [w for w in self.all_words if (w.get("category","") or "Uncategorized") == sel]
-        n = len(self.words)
-        self.deck_lbl.config(text=f"{n} word{'s' if n!=1 else ''}")
-        if n == 0:
-            messagebox.showinfo("No words", f"No words in category '{sel}'.", parent=self)
-        else:
-            self._new_deck()
-
-    def _new_deck(self, *_):
         for w in self.card.winfo_children():
             w.destroy()
-        self._build_card_widgets()
-        self.update_theme()
 
-        self.deck = self.words.copy()
+        top_row = tk.Frame(self.card, bg=C["bg"])
+        top_row.pack(fill="x", pady=(0,4))
+        self.progress_lbl = lbl(top_row, "", font=FONT_UIS, fg=C["ink3"], bg=C["bg"])
+        self.progress_lbl.pack(side="left")
+        self.timer_lbl = lbl(top_row, "", font=FONT_UIB, fg=C["gold"], bg=C["bg"])
+        self.timer_lbl.pack(side="right")
+
+        self.prog_bar_outer = tk.Frame(self.card, bg=C["bg3"], height=4)
+        self.prog_bar_outer.pack(fill="x", pady=(0,10))
+        self.prog_bar_outer.pack_propagate(False)
+        self.prog_bar_inner = tk.Frame(self.prog_bar_outer, bg=C["red"], height=4)
+        self.prog_bar_inner.place(x=0, y=0, relheight=1.0, width=0)
+
+        self.prompt_lbl = lbl(self.card, "", font=FONT_UIS, fg=C["ink2"], bg=C["bg"])
+        self.prompt_lbl.pack(pady=(4,4))
+
+        self.q_box = tk.Frame(self.card, highlightthickness=1,
+                               highlightbackground=C["bg3"], bg=C["bg2"])
+        self.q_box.pack(fill="x", pady=(0,16), ipady=18, ipadx=12)
+        self.q_lbl = lbl(self.q_box, "", font=FONT_JPLG, fg=C["ink"], bg=C["bg2"])
+        self.q_lbl.pack()
+
+        self.srs_badge = lbl(self.card, "", font=FONT_UIS, fg=C["ink3"], bg=C["bg"])
+        self.srs_badge.pack(pady=(0,6))
+
+        self.ans_area = tk.Frame(self.card, bg=C["bg"])
+        self.ans_area.pack(fill="x")
+
+        self.fb_frame = tk.Frame(self.card, bg=C["bg"])
+        self.fb_frame.pack(fill="x", pady=(12,0))
+        self.fb_icon = lbl(self.fb_frame, "", font=("Segoe UI", 22), fg=C["ink"], bg=C["bg"])
+        self.fb_icon.pack()
+        self.fb_lbl  = lbl(self.fb_frame, "", font=FONT_JP,  fg=C["ink2"], bg=C["bg"])
+        self.fb_lbl.pack()
+        self.fb_hint = lbl(self.fb_frame, "", font=FONT_UIS, fg=C["ink3"],  bg=C["bg"])
+        self.fb_hint.pack()
+
+        self.next_btn = FlatButton(self.card, "Next  →", padx=16, pady=8, command=self._next_card)
+        self.next_btn.set_colors(C["blue"], C["white"], C["blue2"])
+
+        self._apply_ctrl_theme()
+
+    def _apply_ctrl_theme(self):
+        try:
+            self.restart_btn.set_colors(C["bg3"], C["ink2"], C["bg2"])
+            self.setup_btn.set_colors(C["bg3"], C["ink2"], C["bg2"])
+            self.deck_lbl.config(bg=C["bg2"], fg=C["ink3"])
+            self.mode_lbl2.config(bg=C["bg2"], fg=C["ink2"])
+        except Exception:
+            pass
+
+    def _new_deck(self, *_):
+        self._cancel_timer()
+        mode = self.mode_var2.get() if hasattr(self, "mode_var2") else self._mode_var.get()
+        self.deck = [w for w in self.words if w.get(self.MODES[mode][0],"")]
         random.shuffle(self.deck)
         self.idx = self.correct = self.wrong = 0
         n = len(self.deck)
         if hasattr(self, "deck_lbl"):
-            self.deck_lbl.config(text=f"{n} word{'s' if n!=1 else ''}")
+            self.deck_lbl.config(text=f"{n} card{'s' if n!=1 else ''}")
+        self._build_card_widgets()
         self._next_card()
 
     def _next_card(self):
+        self._cancel_timer()
         self.next_btn.pack_forget()
-        self.fb_icon.config(text="")
-        self.fb_lbl.config(text="")
-        self.fb_hint.config(text="")
-        self.ans_var.set("")
-        self.ans_entry.config(state="normal", highlightbackground=C["bg3"])
+        for w in [self.fb_icon, self.fb_lbl, self.fb_hint]:
+            w.config(text="")
         self.unbind("<Return>")
 
         if self.idx >= len(self.deck):
@@ -499,72 +1100,943 @@ class QuizWindow(tk.Toplevel):
             return
 
         card = self.deck[self.idx]
-        src, dst = self.MODES[self.mode_var.get()]
-        self.progress_lbl.config(text=f"Card {self.idx+1} / {len(self.deck)}")
+        mode = self.mode_var2.get() if hasattr(self, "mode_var2") else self._mode_var.get()
+        src, dst = self.MODES[mode]
+
+        total  = len(self.deck)
+        filled = int((self.idx / total) * 100) if total else 0
+        self.progress_lbl.config(text=f"Card {self.idx+1} / {total}")
+        self.prog_bar_outer.update_idletasks()
+        bar_w  = self.prog_bar_outer.winfo_width()
+        self.prog_bar_inner.place(width=max(2, int(bar_w * self.idx / total)))
+
         self.prompt_lbl.config(text=f"What is the  {dst.upper()}  of:")
         self.q_lbl.config(text=card.get(src,"") or "(empty)")
+        self.q_box.config(highlightbackground=C["bg3"])
+
+        slvl  = card.get("srs_level", 0)
+        self.srs_badge.config(text=f"SRS: {srs_label(slvl)}  (lv {slvl})")
+
         self._update_score()
+
+        fmt = self._fmt_var.get()
+        if fmt == "mc":
+            self._build_mc(card, dst)
+        else:
+            self._build_type_in(card)
+
+        t = self._timer_var.get()
+        if t > 0:
+            self._time_left = t
+            self._tick()
+
+    def _build_type_in(self, card):
+        for w in self.ans_area.winfo_children():
+            w.destroy()
+        self.ans_area.config(bg=C["bg"])
+        lbl(self.ans_area, "Type your answer:", font=FONT_UIS,
+            fg=C["ink2"], bg=C["bg"]).pack(anchor="w")
+        row = tk.Frame(self.ans_area, bg=C["bg"])
+        row.pack(fill="x", pady=(4,0))
+        self.ans_var = tk.StringVar()
+        self.ans_entry = tk.Entry(row, textvariable=self.ans_var,
+                                   font=FONT_JP, relief="flat", bd=0,
+                                   highlightthickness=2,
+                                   highlightbackground=C["bg3"],
+                                   bg=C["entry_bg"], fg=C["entry_fg"],
+                                   insertbackground=C["entry_fg"])
+        self.ans_entry.pack(side="left", fill="x", expand=True, ipady=8)
+        self.ans_entry.bind("<Return>", lambda e: self._check_type())
+        chk = FlatButton(row, "Check →", command=self._check_type, padx=14, pady=8)
+        chk.set_colors(C["red"], C["white"], C["red2"])
+        chk.pack(side="left", padx=(8,0))
         self.ans_entry.focus()
 
-    def _check(self):
+    def _build_mc(self, card, dst):
+        for w in self.ans_area.winfo_children():
+            w.destroy()
+        self.ans_area.config(bg=C["bg"])
+        correct = (card.get(dst,"") or "").strip()
+        all_vals = list({(w.get(dst,"") or "").strip()
+                         for w in self.all_words
+                         if (w.get(dst,"") or "").strip() and w is not card})
+        if len(all_vals) < 3:
+            self._build_type_in(card)
+            return
+        distractors = random.sample(all_vals, 3)
+        options     = distractors + [correct]
+        random.shuffle(options)
+        self._mc_correct = correct
+        self._mc_answered = False
+        cols_frame = tk.Frame(self.ans_area, bg=C["bg"])
+        cols_frame.pack(fill="x")
+        cols_frame.columnconfigure(0, weight=1)
+        cols_frame.columnconfigure(1, weight=1)
+        self._mc_btns = []
+        for i, opt in enumerate(options):
+            row_i, col_i = divmod(i, 2)
+            b = FlatButton(cols_frame, opt, font=FONT_JP, padx=10, pady=10,
+                           command=lambda o=opt: self._check_mc(o),
+                           wraplength=200)
+            b.grid(row=row_i, column=col_i, sticky="nsew", padx=4, pady=4)
+            b.set_colors(C["bg2"], C["ink"], C["bg3"])
+            self._mc_btns.append((opt, b))
+
+    def _check_type(self):
         if self.idx >= len(self.deck):
             return
+        self._cancel_timer()
         card = self.deck[self.idx]
-        _, dst = self.MODES[self.mode_var.get()]
+        mode = self.mode_var2.get() if hasattr(self, "mode_var2") else self._mode_var.get()
+        _, dst = self.MODES[mode]
         expected = (card.get(dst,"") or "").strip()
         given    = self.ans_var.get().strip()
-        correct  = normalize_kana(given.lower().replace(" ","")) == normalize_kana(expected.lower().replace(" ",""))
+        correct  = normalize_kana(given.lower()) == normalize_kana(expected.lower())
+        self._record(card, correct, expected, dst)
+        try:
+            self.ans_entry.config(state="disabled",
+                highlightbackground=C["green"] if correct else C["red"])
+        except Exception:
+            pass
 
+    def _check_mc(self, chosen):
+        if getattr(self, "_mc_answered", False):
+            return
+        self._mc_answered = True
+        self._cancel_timer()
+        card    = self.deck[self.idx]
+        mode    = self.mode_var2.get() if hasattr(self, "mode_var2") else self._mode_var.get()
+        _, dst  = self.MODES[mode]
+        correct = chosen == self._mc_correct
+        for opt, b in self._mc_btns:
+            if opt == self._mc_correct:
+                b.set_colors(C["green"], C["white"], C["green"])
+            elif opt == chosen and not correct:
+                b.set_colors(C["red"], C["white"], C["red"])
+            else:
+                b.set_colors(C["bg3"], C["ink3"], C["bg3"])
+        self._record(card, correct, self._mc_correct, dst)
+
+    def _auto_fail(self):
+        self.timer_lbl.config(text="✗", fg=C["red"])
+        if self._fmt_var.get() == "mc":
+            self._check_mc("__timeout__")
+        else:
+            try:
+                self.ans_entry.config(state="disabled")
+            except Exception:
+                pass
+            card   = self.deck[self.idx]
+            mode   = self.mode_var2.get() if hasattr(self, "mode_var2") else self._mode_var.get()
+            _, dst = self.MODES[mode]
+            self._record(card, False, (card.get(dst,"") or "").strip(), dst)
+
+    def _record(self, card, correct, expected, dst):
         if correct:
             self.correct += 1
             self.fb_icon.config(text="✓", fg=C["green"])
-            self.fb_lbl.config( text=f"Correct!  {expected}", fg=C["green"])
+            self.fb_lbl.config(text=f"Correct!   {expected}", fg=C["green"])
             self.fb_hint.config(text="")
-            self.ans_entry.config(highlightbackground=C["green"])
         else:
             self.wrong += 1
             self.fb_icon.config(text="✗", fg=C["red"])
-            self.fb_lbl.config( text=f"Answer:  {expected or '(no entry)'}", fg=C["red"])
+            self.fb_lbl.config(text=f"Answer:  {expected or '(no entry)'}", fg=C["red"])
             hint = card.get("comment","")
             if hint and dst != "comment":
                 self.fb_hint.config(text=f"💬  {hint[:80]}")
-            self.ans_entry.config(highlightbackground=C["red"])
-
-        self.ans_entry.config(state="disabled")
+        wid = card.get("id","")
+        if wid:
+            try:
+                for w in self.parent_app.current_dict["words"]:
+                    if w["id"] == wid:
+                        srs_advance(w, correct)
+                        break
+                save_dict(self.parent_app.current_dict)
+            except Exception:
+                pass
+        # badge update
+        slvl = card.get("srs_level", 0)
+        self.srs_badge.config(text=f"SRS: {srs_label(slvl)}  (lv {slvl})")
         self.idx += 1
         self._update_score()
-        self.next_btn.pack(pady=(14,0))
+        self.next_btn.pack(pady=(10,0))
         self.next_btn.focus()
         self.bind("<Return>", lambda e: self._next_card())
+
+    def _tick(self):
+        if self._time_left <= 0:
+            self._auto_fail()
+            return
+        color = C["red"] if self._time_left <= 3 else C["gold"]
+        self.timer_lbl.config(text=f"⏱ {self._time_left}s", fg=color)
+        self._time_left -= 1
+        self._timer_job = self.after(1000, self._tick)
+
+    def _cancel_timer(self):
+        if self._timer_job:
+            self.after_cancel(self._timer_job)
+            self._timer_job = None
+        try:
+            self.timer_lbl.config(text="")
+        except Exception:
+            pass
 
     def _update_score(self):
         self.score_lbl.config(text=f"✓ {self.correct}   ✗ {self.wrong}")
 
     def _show_results(self):
-        for w in self.card.winfo_children():
-            w.destroy()
+        self._cancel_timer()
+        self._clear_content()
+        self._phase = "results"
+        c = self.content
+        c.config(bg=C["bg"])
+
         total = self.correct + self.wrong
         pct   = int(self.correct / total * 100) if total else 0
-        if   pct >= 90: grade = "🏆 Excellent!"
-        elif pct >= 70: grade = "👍 Good job!"
-        elif pct >= 50: grade = "📖 Keep studying!"
-        else:           grade = "😤 More practice!"
-        
-        lbl(self.card, grade, font=FONT_H1, fg=C["ink"], bg=C["bg"]).pack(pady=(30,8))
-        lbl(self.card, f"{self.correct} / {total}  ({pct}%)",
-            font=FONT_H2, bg=C["bg"], fg=C["green"] if pct >= 70 else C["red"]).pack()
-        lbl(self.card, f"✓ {self.correct} correct   ✗ {self.wrong} wrong",
+        if   pct >= 90: grade, gc = "🏆  Excellent!", "gold"
+        elif pct >= 70: grade, gc = "👍  Good Job!",  "green"
+        elif pct >= 50: grade, gc = "📖  Keep Going!", "blue"
+        else:           grade, gc = "😤  More Practice!", "red"
+
+        lbl(c, grade, font=FONT_H1, fg=C[gc], bg=C["bg"]).pack(pady=(32,8))
+        lbl(c, f"{self.correct} / {total}  ({pct}%)",
+            font=FONT_H2, fg=C["green"] if pct >= 70 else C["red"],
+            bg=C["bg"]).pack()
+        lbl(c, f"✓ {self.correct} correct   ✗ {self.wrong} wrong",
             font=FONT_UI, fg=C["ink2"], bg=C["bg"]).pack(pady=(4,24))
 
-        try_again_btn = FlatButton(self.card, "Try Again", command=self._new_deck)
-        try_again_btn.pack()
-        try_again_btn.set_colors(bg=C["blue"], fg=C["white"], hover_bg=C["blue2"])
+        # SRS summary
+        due_now = sum(1 for w in self.all_words if srs_is_due(w))
+        mastered= sum(1 for w in self.all_words if w.get("srs_level",0) >= 5)
+        lbl(c, f"SRS — Due now: {due_now}   Mastered: {mastered}/{len(self.all_words)}",
+            font=FONT_UIS, fg=C["ink3"], bg=C["bg"]).pack(pady=(0,20))
 
-        close_btn = FlatButton(self.card, "Close", command=self.destroy,
-                   font=FONT_UI, padx=12, pady=7)
-        close_btn.pack(pady=(8,0))
-        close_btn.set_colors(bg=C["bg3"], fg=C["ink2"], hover_bg=C["bg2"])
+        btn_row = tk.Frame(c, bg=C["bg"])
+        btn_row.pack()
+        again = FlatButton(btn_row, "Try Again", command=self._new_deck, padx=14, pady=8)
+        again.set_colors(C["red"], C["white"], C["red2"])
+        again.pack(side="left", padx=6)
+        setup_b = FlatButton(btn_row, "⚙  Change Setup", command=self._show_setup,
+                              font=FONT_UI, padx=12, pady=8)
+        setup_b.set_colors(C["bg3"], C["ink2"], C["bg2"])
+        setup_b.pack(side="left", padx=6)
+        close_b = FlatButton(btn_row, "Close", command=self.destroy,
+                              font=FONT_UI, padx=12, pady=8)
+        close_b.set_colors(C["bg3"], C["ink2"], C["bg2"])
+        close_b.pack(side="left", padx=6)
 
+    def update_theme(self):
+        self.configure(bg=C["bg"])
+        self.hdr.config(bg=C["sidebar"])
+        self.hdr_lbl.config(bg=C["sidebar"])
+        self.score_lbl.config(bg=C["sidebar"])
+        self.sep0.config(bg=C["bg3"])
+        self.content.config(bg=C["bg"])
+
+
+class JLPTManagerDialog(tk.Toplevel):
+    """Download JLPT data and tag words in the current dictionary."""
+
+    def __init__(self, parent, current_dict):
+        super().__init__(parent)
+        self.title("JLPT Data & Tagging")
+        self.resizable(False, False)
+        self.current_dict = current_dict
+        self.cache = load_jlpt_cache()
+        self.after(50, lambda: _safe_grab(self))
+        self._build_ui()
+        self._update_theme()
+        self._center(parent)
+        self._refresh_status()
+
+    def _build_ui(self):
+        self.hdr = tk.Frame(self, pady=14)
+        self.hdr.pack(fill="x")
+        self.hdr_lbl = lbl(self.hdr, "🎌  JLPT Data Manager", font=FONT_H2, fg=C["white"])
+        self.hdr_lbl.pack(padx=20, anchor="w")
+
+        self.body = tk.Frame(self, padx=24, pady=12)
+        self.body.pack(fill="both", expand=True)
+
+        lbl(self.body, "Cached levels (downloaded once, stored locally):",
+            font=FONT_UIS, fg=C["ink2"]).pack(anchor="w", pady=(0,8))
+
+        self.level_rows = {}
+        for lvl in JLPT_LEVEL_NAMES:
+            row = tk.Frame(self.body)
+            row.pack(fill="x", pady=3)
+            name_l = lbl(row, lvl, font=FONT_UIB, fg=C["ink"], width=4)
+            name_l.pack(side="left")
+            status_l = lbl(row, "—", font=FONT_UIS, fg=C["ink3"])
+            status_l.pack(side="left", padx=8)
+            btn = FlatButton(row, "Download", command=lambda l=lvl: self._download(l),
+                             font=FONT_UIS, padx=10, pady=4)
+            btn.pack(side="right")
+            self.level_rows[lvl] = (name_l, status_l, btn)
+
+        sep(self.body).pack(fill="x", pady=12)
+
+        self.log_var = tk.StringVar(value="")
+        lbl_log = lbl(self.body, "", textvariable=self.log_var,
+                      font=FONT_UIS, fg=C["ink3"])
+        lbl_log.pack(anchor="w")
+        self.log_lbl = lbl_log
+
+        sep(self.body).pack(fill="x", pady=12)
+
+        lbl(self.body, "Tag your dictionary words with JLPT level:",
+            font=FONT_UIS, fg=C["ink2"]).pack(anchor="w", pady=(0,6))
+
+        if self.current_dict:
+            self.tagged_var = tk.StringVar(value="")
+            lbl(self.body, "", textvariable=self.tagged_var,
+                font=FONT_UIS, fg=C["ink3"]).pack(anchor="w", pady=(0,6))
+            self._refresh_tagged()
+            tag_btn = FlatButton(self.body, "⚡  Auto-Tag All Words",
+                                  command=self._tag_words, font=FONT_UI, padx=14, pady=7)
+            tag_btn.set_colors(C["red"], C["white"], C["red2"])
+            tag_btn.pack(anchor="w")
+            self.tag_btn = tag_btn
+        else:
+            lbl(self.body, "No dictionary loaded.", font=FONT_UIS, fg=C["ink3"]).pack(anchor="w")
+
+        sep(self.body).pack(fill="x", pady=10)
+        close_btn = FlatButton(self.body, "Done", command=self.destroy,
+                               font=FONT_UI, padx=14, pady=7)
+        close_btn.set_colors(C["bg3"], C["ink2"], C["bg2"])
+        close_btn.pack(anchor="e")
+        self.close_btn = close_btn
+
+    def _refresh_status(self):
+        for lvl, (nl, sl, btn) in self.level_rows.items():
+            entries = self.cache.get(lvl, None)
+            if entries is not None:
+                sl.config(text=f"✓ {len(entries)} words cached", fg=C["green"])
+                btn.config(text="Re-download")
+                btn.set_colors(C["bg3"], C["ink2"], C["bg2"])
+            else:
+                sl.config(text="Not downloaded", fg=C["ink3"])
+                btn.config(text="Download")
+                btn.set_colors(C["blue"], C["white"], C["blue2"])
+
+    def _refresh_tagged(self):
+        if not self.current_dict:
+            return
+        words   = self.current_dict.get("words", [])
+        tagged  = sum(1 for w in words if w.get("jlpt_level",""))
+        self.tagged_var.set(f"{tagged}/{len(words)} words tagged with JLPT level")
+
+    def _download(self, lvl):
+        n = int(lvl[1])   # "N5" → 5, "N2" → 2
+        self.log_var.set(f"Downloading {lvl}…")
+        _, sl, btn = self.level_rows[lvl]
+        sl.config(text="Downloading…", fg=C["gold"])
+        btn.config(state="disabled")
+
+        def _done(level_key, count, err):
+            if err:
+                self.after(0, lambda: (
+                    sl.config(text=f"Error: {err[:40]}", fg=C["red"]),
+                    btn.config(state="normal"),
+                    self.log_var.set(f"Failed to download {level_key}"),
+                ))
+            else:
+                self.cache = load_jlpt_cache()
+                self.after(0, lambda: (
+                    self._refresh_status(),
+                    self.log_var.set(f"{level_key}: {count} entries cached ✓"),
+                ))
+
+        fetch_jlpt_level(n, self.cache, on_done=_done)
+
+    def _tag_words(self):
+        if not self.current_dict:
+            return
+        if not any(self.cache.get(lvl) for lvl in JLPT_LEVEL_NAMES):
+            messagebox.showwarning("No Data",
+                "Download at least one JLPT level first.", parent=self)
+            return
+        count = 0
+        for w in self.current_dict["words"]:
+            lvl = jlpt_lookup(w, self.cache)
+            if lvl:
+                w["jlpt_level"] = lvl
+                count += 1
+            elif "jlpt_level" not in w:
+                w["jlpt_level"] = ""
+        save_dict(self.current_dict)
+        self._refresh_tagged()
+        self.log_var.set(f"Tagged {count} words with JLPT levels ✓")
+        messagebox.showinfo("Done", f"Tagged {count} of {len(self.current_dict['words'])} words.",
+                            parent=self)
+
+    def _update_theme(self):
+        self.configure(bg=C["bg"])
+        self.hdr.config(bg=C["sidebar"])
+        self.hdr_lbl.config(bg=C["sidebar"], fg=C["white"])
+        self.body.config(bg=C["bg"])
+        self.log_lbl.config(bg=C["bg"])
+        for _, (nl, sl, btn) in self.level_rows.items():
+            nl.config(bg=C["bg"])
+            sl.config(bg=C["bg"])
+
+    def _center(self, parent):
+        self.update_idletasks()
+        pw, ph = parent.winfo_width(), parent.winfo_height()
+        px, py = parent.winfo_x(), parent.winfo_y()
+        w, h = self.winfo_reqwidth(), self.winfo_reqheight()
+        self.geometry(f"{w}x{h}+{px+pw//2-w//2}+{py+ph//2-h//2}")
+
+
+class ExamWindow(tk.Toplevel):
+    """JLPT-style exam using your dictionary words cross-referenced with official vocab."""
+
+    SECTIONS = [
+        ("文字 (Kanji Reading)", "word",    "reading"),
+        ("語彙 (Vocabulary)",    "reading", "word"),
+        ("意味 (Meaning)",       "word",    "meaning_or_comment"),
+    ]
+
+    def __init__(self, parent, current_dict):
+        super().__init__(parent)
+        self.title("JLPT Exam Mode  — 試験")
+        self.geometry("600x660")
+        self.minsize(520, 560)
+        self.resizable(True, True)
+        self.after(50, lambda: _safe_grab(self))
+
+        self.parent_app   = parent
+        self.current_dict = current_dict
+        self.cache        = load_jlpt_cache()
+        self._timer_job   = None
+
+        self._build_skeleton()
+        self.update_theme()
+        self._show_setup()
+
+    def _build_skeleton(self):
+        self.hdr = tk.Frame(self)
+        self.hdr.pack(fill="x")
+        self.hdr_lbl = lbl(self.hdr, "試験  JLPT Exam", font=FONT_H2, fg=C["white"])
+        self.hdr_lbl.pack(side="left", padx=16, pady=12)
+        self.score_lbl = lbl(self.hdr, "", font=FONT_UIS, fg=C["ink3"])
+        self.score_lbl.pack(side="right", padx=16)
+        sep(self).pack(fill="x")
+        self.content = tk.Frame(self)
+        self.content.pack(fill="both", expand=True)
+
+    def _clear(self):
+        for w in self.content.winfo_children():
+            w.destroy()
+
+    def _show_setup(self):
+        self._cancel_timer()
+        self._clear()
+        self.score_lbl.config(text="")
+        c = self.content
+        c.config(bg=C["bg"])
+        pad = tk.Frame(c, bg=C["bg"])
+        pad.pack(fill="both", expand=True, padx=28, pady=16)
+
+        lbl(pad, "Select JLPT Level", font=FONT_H2, fg=C["ink"], bg=C["bg"]).pack(anchor="w")
+        sep(pad, bg=C["bg3"]).pack(fill="x", pady=(6,14))
+
+        available = [lvl for lvl in JLPT_LEVEL_NAMES if self.cache.get(lvl)]
+
+        if not available:
+            lbl(pad, "⚠  No JLPT vocab data downloaded yet.", font=FONT_UI,
+                fg=C["gold"], bg=C["bg"]).pack(anchor="w", pady=(0,4))
+            lbl(pad, "You can still take a grammar-only exam below.",
+                font=FONT_UIS, fg=C["ink2"], bg=C["bg"]).pack(anchor="w", pady=(0,12))
+            available_g = [lvl for lvl in JLPT_LEVEL_NAMES if GRAMMAR_QUESTIONS.get(lvl)]
+            self._exam_level_var = tk.StringVar(value=available_g[0] if available_g else "N5")
+            level_row = tk.Frame(pad, bg=C["bg"])
+            level_row.pack(fill="x", pady=(0,16))
+            self._lvl_btns = {}
+            for lvl in available_g:
+                b = FlatButton(level_row, f"{lvl}\n(grammar only)",
+                               command=lambda l=lvl: self._sel_level(l),
+                               font=FONT_UIS, padx=14, pady=10)
+                b.pack(side="left", padx=(0,8))
+                self._lvl_btns[lvl] = b
+            self._sel_level(available_g[0] if available_g else "N5")
+
+            self._section_vars = {}
+            for sec_name, src, dst in self.SECTIONS:
+                self._section_vars[sec_name] = (tk.BooleanVar(value=False), src, dst)
+
+            grammar_count = len(GRAMMAR_QUESTIONS.get(self._exam_level_var.get(), []))
+            self._grammar_var = tk.BooleanVar(value=True)
+            grammar_row = tk.Frame(pad, bg=C["bg"])
+            grammar_row.pack(anchor="w", pady=(0,16))
+            tk.Checkbutton(grammar_row, text="文法 (Grammar / Particles)",
+                           variable=self._grammar_var,
+                           font=FONT_UI, bg=C["bg"], fg=C["ink"],
+                           selectcolor=C["bg2"], activebackground=C["bg"]).pack(side="left")
+            lbl(grammar_row, f"  {grammar_count} questions",
+                font=FONT_UIS, fg=C["ink3"], bg=C["bg"]).pack(side="left")
+
+            self._exam_timer_var = tk.IntVar(value=20)
+            tmr_row = tk.Frame(pad, bg=C["bg"])
+            tmr_row.pack(fill="x", pady=(0,16))
+            self._etmr_btns = {}
+            for t in [0, 10, 15, 20, 30]:
+                label = "Off" if t == 0 else f"{t}s"
+                b = FlatButton(tmr_row, label, font=FONT_UIS, padx=10, pady=5,
+                               command=lambda tv=t: self._sel_etimer(tv))
+                b.pack(side="left", padx=(0,5))
+                self._etmr_btns[t] = b
+            self._sel_etimer(20)
+
+            btn_row = tk.Frame(pad, bg=C["bg"])
+            btn_row.pack(fill="x")
+            start_btn = FlatButton(btn_row, "Begin Grammar Exam  →", command=self._start_exam,
+                                    padx=18, pady=9)
+            start_btn.set_colors(C["red"], C["white"], C["red2"])
+            start_btn.pack(side="right")
+            return
+
+        self._exam_level_var = tk.StringVar(value=available[0])
+        level_row = tk.Frame(pad, bg=C["bg"])
+        level_row.pack(fill="x", pady=(0,16))
+        self._lvl_btns = {}
+        for lvl in available:
+            pool_size = len(get_exam_pool(
+                self.current_dict.get("words",[]), self.cache, lvl))
+            b = FlatButton(level_row, f"{lvl}\n({pool_size} matching words)",
+                           command=lambda l=lvl: self._sel_level(l),
+                           font=FONT_UIS, padx=14, pady=10)
+            b.pack(side="left", padx=(0,8))
+            self._lvl_btns[lvl] = b
+        self._sel_level(available[0])
+
+        lbl(pad, "Sections", font=FONT_H2, fg=C["ink"], bg=C["bg"]).pack(anchor="w", pady=(12,4))
+        sep(pad, bg=C["bg3"]).pack(fill="x", pady=(0,10))
+        self._section_vars = {}
+        for sec_name, src, dst in self.SECTIONS:
+            v = tk.BooleanVar(value=True)
+            cb = tk.Checkbutton(pad, text=sec_name, variable=v,
+                                font=FONT_UI, bg=C["bg"], fg=C["ink"],
+                                selectcolor=C["bg2"], activebackground=C["bg"])
+            cb.pack(anchor="w", pady=2)
+            self._section_vars[sec_name] = (v, src, dst)
+
+        grammar_count = len(GRAMMAR_QUESTIONS.get(available[0] if available else "N5", []))
+        self._grammar_var = tk.BooleanVar(value=True)
+        grammar_row = tk.Frame(pad, bg=C["bg"])
+        grammar_row.pack(anchor="w", pady=2)
+        tk.Checkbutton(grammar_row, text="文法 (Grammar / Particles)",
+                       variable=self._grammar_var,
+                       font=FONT_UI, bg=C["bg"], fg=C["ink"],
+                       selectcolor=C["bg2"], activebackground=C["bg"]).pack(side="left")
+        lbl(grammar_row, f"  {grammar_count} built-in questions",
+            font=FONT_UIS, fg=C["ink3"], bg=C["bg"]).pack(side="left")
+
+        lbl(pad, "Timer per Question", font=FONT_H2, fg=C["ink"], bg=C["bg"]).pack(anchor="w", pady=(14,4))
+        sep(pad, bg=C["bg3"]).pack(fill="x", pady=(0,10))
+        self._exam_timer_var = tk.IntVar(value=20)
+        tmr_row = tk.Frame(pad, bg=C["bg"])
+        tmr_row.pack(fill="x")
+        self._etmr_btns = {}
+        for t in [0, 10, 15, 20, 30]:
+            label = "Off" if t == 0 else f"{t}s"
+            b = FlatButton(tmr_row, label, font=FONT_UIS, padx=10, pady=5,
+                           command=lambda tv=t: self._sel_etimer(tv))
+            b.pack(side="left", padx=(0,5))
+            self._etmr_btns[t] = b
+        self._sel_etimer(20)
+
+        btn_row = tk.Frame(pad, bg=C["bg"])
+        btn_row.pack(fill="x", pady=(20,0))
+        start_btn = FlatButton(btn_row, "Begin Exam  →", command=self._start_exam,
+                                padx=18, pady=9)
+        start_btn.set_colors(C["red"], C["white"], C["red2"])
+        start_btn.pack(side="right")
+
+    def _sel_level(self, lvl):
+        self._exam_level_var.set(lvl)
+        for l, b in self._lvl_btns.items():
+            b.set_colors(C["red"] if l == lvl else C["bg3"],
+                         C["white"] if l == lvl else C["ink2"],
+                         C["red2"] if l == lvl else C["bg2"])
+
+    def _sel_etimer(self, t):
+        self._exam_timer_var.set(t)
+        for tv, b in self._etmr_btns.items():
+            b.set_colors(C["gold"] if tv == t else C["bg3"],
+                         C["sidebar"] if tv == t else C["ink2"],
+                         C["gold"] if tv == t else C["bg2"])
+
+    _CTX_SENTENCES = [
+        ("昨日、{TARGET}を 買いました。",             "Yesterday, I bought {TARGET}."),
+        ("この {TARGET}は とても 便利です。",          "This {TARGET} is very useful."),
+        ("友達に {TARGET}を あげました。",             "I gave {TARGET} to a friend."),
+        ("先生は {TARGET}を 説明しました。",           "The teacher explained {TARGET}."),
+        ("{TARGET}を 使って ください。",              "Please use {TARGET}."),
+        ("今日は {TARGET}が ありません。",             "There is no {TARGET} today."),
+        ("私は {TARGET}が 好きです。",                "I like {TARGET}."),
+        ("{TARGET}は どこに ありますか？",             "Where is {TARGET}?"),
+        ("毎朝 {TARGET}を 見ています。",              "I look at {TARGET} every morning."),
+        ("この 問題は {TARGET}に 関係しています。",    "This problem relates to {TARGET}."),
+    ]
+
+    def _start_exam(self):
+        lvl      = self._exam_level_var.get()
+        pool     = get_exam_pool(self.current_dict.get("words",[]), self.cache, lvl)
+        all_jlpt = self.cache.get(lvl, [])
+        user_words = self.current_dict.get("words", [])
+
+        questions = []
+
+        for sec_name, src, dst in self.SECTIONS:
+            v, _s, _d = self._section_vars[sec_name]
+            if not v.get():
+                continue
+            if len(pool) < 4:
+                continue
+            for entry in pool:
+                q_word    = entry.get("word","") or ""
+                q_reading = entry.get("reading","") or ""
+                q_meaning = entry.get("meaning","") or ""
+                uw = next((w for w in user_words
+                           if normalize_kana((w.get("word","") or "").lower()) ==
+                              normalize_kana(q_word.lower())), None)
+                if uw and uw.get("comment",""):
+                    q_meaning = uw["comment"]
+
+                if src == "word":
+                    q_show = q_word
+                    a_text = q_reading if dst == "reading" else q_meaning
+                else:  # src == "reading"
+                    q_show = q_reading
+                    a_text = q_word
+
+                if not q_show or not a_text:
+                    continue
+
+                ctx_jp, ctx_en = random.choice(self._CTX_SENTENCES)
+                if dst == "reading":
+                    prompt_jp = ctx_jp.replace("{TARGET}", q_word)
+                    prompt_en = ctx_en.replace("{TARGET}", f"[{q_word}]")
+                    prompt_label = "What is the reading of the underlined word?"
+                elif dst == "word":
+                    prompt_jp = ctx_jp.replace("{TARGET}", q_reading)
+                    prompt_en = ctx_en.replace("{TARGET}", f"[{q_reading}]")
+                    prompt_label = "Which kanji correctly writes the underlined word?"
+                else:  # meaning
+                    prompt_jp = ctx_jp.replace("{TARGET}", q_word)
+                    prompt_en = ctx_en.replace("{TARGET}", f"[{q_word}]")
+                    prompt_label = "What does the underlined word mean?"
+
+                dist_pool = [e.get(dst,"") or e.get("reading","") if dst != "meaning_or_comment"
+                             else e.get("meaning","")
+                             for e in all_jlpt
+                             if (e.get("word","") or "") != q_word
+                             and (e.get(dst,"") or e.get("reading","") if dst != "meaning_or_comment"
+                                  else e.get("meaning",""))]
+                dist_pool = [d for d in dist_pool if d and d != a_text]
+                if len(dist_pool) < 3:
+                    continue
+                distractors = random.sample(dist_pool, 3)
+                options = distractors + [a_text]
+                random.shuffle(options)
+                questions.append({
+                    "type":         "vocab",
+                    "section":      sec_name,
+                    "q":            prompt_jp,
+                    "q_label":      prompt_label,
+                    "translation":  prompt_en,
+                    "a":            a_text,
+                    "options":      options,
+                    "explanation":  f"The correct answer is: {a_text}",
+                })
+
+        if getattr(self, "_grammar_var", None) and self._grammar_var.get():
+            gram_qs = get_grammar_questions(lvl)
+            random.shuffle(gram_qs)
+            for gq in gram_qs:
+                questions.append({
+                    "type":        "grammar",
+                    "section":     "文法 (Grammar)",
+                    "q":           gq["sentence"],
+                    "translation": gq["translation"],
+                    "a":           gq["options"][gq["answer"]],
+                    "options":     gq["options"],
+                    "explanation": gq.get("explanation",""),
+                })
+            tmpl_qs = build_template_questions(lvl, user_words, max_q=15)
+            for tq in tmpl_qs:
+                questions.append({
+                    "type":        "grammar",
+                    "section":     "文法 — Personal (Grammar with your words)",
+                    "q":           tq["sentence"],
+                    "translation": tq["translation"],
+                    "a":           tq["options"][tq["answer"]],
+                    "options":     tq["options"],
+                    "explanation": tq.get("explanation",""),
+                })
+
+        if not questions:
+            messagebox.showwarning("No Questions",
+                "Could not build any questions.\n\n"
+                "• Vocab sections: download JLPT data (Tools → JLPT Data Manager)"
+                " and ensure your words match.\n"
+                "• Grammar: enable the 文法 section.", parent=self)
+            return
+
+        random.shuffle(questions)
+        self.questions  = questions
+        self.q_idx      = 0
+        self.q_correct  = 0
+        self.q_wrong    = 0
+        self.q_answered = []
+        self._build_exam_ui()
+        self._show_question()
+
+    # exam ui
+    def _build_exam_ui(self):
+        self._clear()
+        c = self.content
+        c.config(bg=C["bg"])
+
+        ctrl = tk.Frame(c, bg=C["bg2"])
+        ctrl.pack(fill="x")
+        ctrl_i = tk.Frame(ctrl, bg=C["bg2"])
+        ctrl_i.pack(fill="x", padx=12, pady=6)
+        self.sect_lbl = lbl(ctrl_i, "", font=FONT_UIS, fg=C["ink2"], bg=C["bg2"])
+        self.sect_lbl.pack(side="left")
+        self.q_prog_lbl = lbl(ctrl_i, "", font=FONT_UIS, fg=C["ink3"], bg=C["bg2"])
+        self.q_prog_lbl.pack(side="right")
+        sep(c).pack(fill="x")
+
+        self.card = tk.Frame(c, bg=C["bg"])
+        self.card.pack(fill="both", expand=True, padx=28, pady=16)
+
+    def _show_question(self):
+        self._cancel_timer()
+        for w in self.card.winfo_children():
+            w.destroy()
+        self.card.config(bg=C["bg"])
+
+        if self.q_idx >= len(self.questions):
+            self._show_exam_results()
+            return
+
+        q     = self.questions[self.q_idx]
+        total = len(self.questions)
+
+        self.sect_lbl.config(text=q["section"])
+        self.q_prog_lbl.config(text=f"Q {self.q_idx+1} / {total}")
+        self.score_lbl.config(text=f"✓ {self.q_correct}   ✗ {self.q_wrong}")
+
+        bar_outer = tk.Frame(self.card, bg=C["bg3"], height=4)
+        bar_outer.pack(fill="x", pady=(0,14))
+        bar_outer.pack_propagate(False)
+        bar_outer.update_idletasks()
+        bw = bar_outer.winfo_width() or 500
+        bar_inner = tk.Frame(bar_outer, bg=C["red"], height=4,
+                              width=max(2, int(bw * self.q_idx / total)))
+        bar_inner.place(x=0, y=0, relheight=1.0)
+
+        tmr_row = tk.Frame(self.card, bg=C["bg"])
+        tmr_row.pack(fill="x")
+        lbl(tmr_row, f"Question {self.q_idx+1}", font=FONT_UIS,
+            fg=C["ink3"], bg=C["bg"]).pack(side="left")
+        self.exam_timer_lbl = lbl(tmr_row, "", font=FONT_UIB, fg=C["gold"], bg=C["bg"])
+        self.exam_timer_lbl.pack(side="right")
+
+        is_grammar = q.get("type") == "grammar"
+
+        if is_grammar:
+            sent_outer = tk.Frame(self.card, bg=C["red"], pady=0)
+            sent_outer.pack(fill="x", pady=(8,6))
+            sent_inner = tk.Frame(sent_outer, bg=C["bg2"])
+            sent_inner.pack(fill="x", padx=3)
+            badge_row = tk.Frame(sent_inner, bg=C["bg2"])
+            badge_row.pack(fill="x", padx=12, pady=(10,2))
+            q_num = self.q_idx + 1
+            lbl(badge_row, f"{q_num}", font=FONT_UIB,
+                fg=C["red"], bg=C["bg2"]).pack(side="left")
+            lbl(badge_row, "  文法問題", font=FONT_UIS,
+                fg=C["ink3"], bg=C["bg2"]).pack(side="left")
+            sentence_lbl = lbl(sent_inner, q["q"], font=FONT_JP,
+                                fg=C["ink"], bg=C["bg2"],
+                                wraplength=480, justify="left")
+            sentence_lbl.pack(anchor="w", padx=16, pady=(4,4))
+            trans_frame = tk.Frame(sent_inner, bg=C["bg3"], padx=12, pady=8)
+            trans_frame.pack(fill="x", padx=12, pady=(4,10))
+            lbl(trans_frame, "Tradução:", font=FONT_UIS,
+                fg=C["ink3"], bg=C["bg3"]).pack(anchor="w")
+            lbl(trans_frame, q.get("translation",""), font=FONT_UI,
+                fg=C["ink2"], bg=C["bg3"],
+                wraplength=440, justify="left").pack(anchor="w", pady=(2,0))
+        else:
+            # vocab
+            sent_outer = tk.Frame(self.card, bg=C["blue"], pady=0)
+            sent_outer.pack(fill="x", pady=(8,6))
+            sent_inner = tk.Frame(sent_outer, bg=C["bg2"])
+            sent_inner.pack(fill="x", padx=3)
+            q_label_text = q.get("q_label", "Answer the question about the underlined word.")
+            lbl(sent_inner, q_label_text, font=FONT_UIS,
+                fg=C["ink3"], bg=C["bg2"]).pack(anchor="w", padx=14, pady=(10,4))
+            lbl(sent_inner, q["q"], font=FONT_JP, fg=C["ink"], bg=C["bg2"],
+                wraplength=480, justify="left").pack(anchor="w", padx=16, pady=(0,4))
+            trans_frame = tk.Frame(sent_inner, bg=C["bg3"], padx=12, pady=6)
+            trans_frame.pack(fill="x", padx=12, pady=(4,10))
+            lbl(trans_frame, q.get("translation",""), font=FONT_UI,
+                fg=C["ink2"], bg=C["bg3"],
+                wraplength=440, justify="left").pack(anchor="w")
+
+        self._exam_answered = False
+        self._exam_correct  = q["a"]
+        self._exam_explanation = q.get("explanation","")
+        opts_frame = tk.Frame(self.card, bg=C["bg"])
+        opts_frame.pack(fill="x", pady=(is_grammar and 2 or 0, 0))
+        opts_frame.columnconfigure(0, weight=1)
+        opts_frame.columnconfigure(1, weight=1)
+        self._exam_opt_btns = []
+        labels = ["A", "B", "C", "D"]
+        for i, opt in enumerate(q["options"]):
+            ri, ci = divmod(i, 2)
+            display = f"{labels[i]}  {opt}"
+            b = FlatButton(opts_frame, display, font=FONT_JP, padx=10, pady=10,
+                           command=lambda o=opt: self._exam_pick(o),
+                           wraplength=220)
+            b.grid(row=ri, column=ci, sticky="nsew", padx=5, pady=5)
+            b.set_colors(C["bg2"], C["ink"], C["bg3"])
+            self._exam_opt_btns.append((opt, b))
+
+        # placeholder
+        self.explain_frame = tk.Frame(self.card, bg=C["bg"])
+        self.explain_frame.pack(fill="x", pady=(8,0))
+
+        t = self._exam_timer_var.get()
+        if t > 0:
+            self._exam_time_left = t
+            self._exam_tick()
+
+    def _exam_pick(self, chosen):
+        if self._exam_answered:
+            return
+        self._exam_answered = True
+        self._cancel_timer()
+        correct = (chosen == self._exam_correct)
+        if correct:
+            self.q_correct += 1
+        else:
+            self.q_wrong += 1
+        self.q_answered.append((self.questions[self.q_idx], correct, chosen))
+
+        for opt, b in self._exam_opt_btns:
+            if opt == self._exam_correct:
+                b.set_colors(C["green"], C["white"], C["green"])
+            elif opt == chosen and not correct:
+                b.set_colors(C["red"], C["white"], C["red"])
+            else:
+                b.set_colors(C["bg3"], C["ink3"], C["bg3"])
+
+        # show explanation if available
+        explanation = getattr(self, "_exam_explanation", "")
+        if explanation:
+            icon = "✓" if correct else "✗"
+            icon_color = C["green"] if correct else C["red"]
+            try:
+                for w in self.explain_frame.winfo_children():
+                    w.destroy()
+                self.explain_frame.config(bg=C["bg3"])
+                inner = tk.Frame(self.explain_frame, bg=C["bg3"])
+                inner.pack(fill="x", padx=12, pady=8)
+                lbl(inner, f"{icon}  Explicação:", font=FONT_UIB,
+                    fg=icon_color, bg=C["bg3"]).pack(anchor="w")
+                lbl(inner, explanation, font=FONT_UIS, fg=C["ink2"],
+                    bg=C["bg3"], wraplength=480, justify="left").pack(anchor="w", pady=(4,0))
+            except Exception:
+                pass
+
+        self.q_idx += 1
+        next_b = FlatButton(self.card,
+                             "Próxima  →" if self.q_idx < len(self.questions) else "Ver Resultado  →",
+                             command=self._show_question, padx=14, pady=8)
+        next_b.set_colors(C["blue"], C["white"], C["blue2"])
+        next_b.pack(pady=(10,0))
+        next_b.focus()
+        self.bind("<Return>", lambda e: self._show_question())
+
+    def _exam_tick(self):
+        if self._exam_time_left <= 0:
+            self.exam_timer_lbl.config(text="✗ Time!", fg=C["red"])
+            self._exam_pick("__timeout__")
+            return
+        col = C["red"] if self._exam_time_left <= 5 else C["gold"]
+        self.exam_timer_lbl.config(text=f"⏱ {self._exam_time_left}s", fg=col)
+        self._exam_time_left -= 1
+        self._timer_job = self.after(1000, self._exam_tick)
+
+    def _cancel_timer(self):
+        if self._timer_job:
+            self.after_cancel(self._timer_job)
+            self._timer_job = None
+
+    def _show_exam_results(self):
+        self._cancel_timer()
+        self._clear()
+        c = self.content
+        c.config(bg=C["bg"])
+
+        total = self.q_correct + self.q_wrong
+        pct   = int(self.q_correct / total * 100) if total else 0
+        if   pct >= 90: grade, gc = "🏆  Excellent!",       "gold"
+        elif pct >= 70: grade, gc = "👍  Good result!",      "green"
+        elif pct >= 50: grade, gc = "📖  Needs more study.", "blue"
+        else:           grade, gc = "📝  More practice!",    "red"
+
+        lbl(c, grade, font=FONT_H1, fg=C[gc], bg=C["bg"]).pack(pady=(28,6))
+        lbl(c, f"{self.q_correct} / {total}  ({pct}%)",
+            font=FONT_H2, fg=C["green"] if pct >= 70 else C["red"],
+            bg=C["bg"]).pack()
+        lbl(c, f"✓ {self.q_correct} correct   ✗ {self.q_wrong} wrong",
+            font=FONT_UI, fg=C["ink2"], bg=C["bg"]).pack(pady=(4,10))
+
+        # Section breakdown
+        section_scores = {}
+        for q, ok, _ in self.q_answered:
+            sec = q["section"]
+            section_scores.setdefault(sec, [0,0])
+            if ok:
+                section_scores[sec][0] += 1
+            section_scores[sec][1] += 1
+
+        if section_scores:
+            sep(c, bg=C["bg3"]).pack(fill="x", padx=28, pady=8)
+            lbl(c, "Section Breakdown", font=FONT_UIB, fg=C["ink2"],
+                bg=C["bg"]).pack(anchor="w", padx=28)
+            for sec, (cor, tot) in sorted(section_scores.items()):
+                sp = int(cor/tot*100) if tot else 0
+                row = tk.Frame(c, bg=C["bg"])
+                row.pack(fill="x", padx=28, pady=2)
+                lbl(row, sec, font=FONT_UIS, fg=C["ink"], bg=C["bg"]).pack(side="left")
+                lbl(row, f"{cor}/{tot}  ({sp}%)",
+                    font=FONT_UIS, fg=C["green"] if sp >= 70 else C["red"],
+                    bg=C["bg"]).pack(side="right")
+
+        sep(c, bg=C["bg3"]).pack(fill="x", padx=28, pady=12)
+        btn_row = tk.Frame(c, bg=C["bg"])
+        btn_row.pack()
+        retry = FlatButton(btn_row, "Retry", command=self._show_setup,
+                            padx=14, pady=8)
+        retry.set_colors(C["red"], C["white"], C["red2"])
+        retry.pack(side="left", padx=6)
+        close_b = FlatButton(btn_row, "Close", command=self.destroy,
+                              font=FONT_UI, padx=14, pady=8)
+        close_b.set_colors(C["bg3"], C["ink2"], C["bg2"])
+        close_b.pack(side="left", padx=6)
+
+    def update_theme(self):
+        self.configure(bg=C["bg"])
+        self.hdr.config(bg=C["sidebar"])
+        self.hdr_lbl.config(bg=C["sidebar"], fg=C["white"])
+        self.score_lbl.config(bg=C["sidebar"])
+        self.content.config(bg=C["bg"])
 
 
 # category manager
@@ -895,7 +2367,7 @@ class StatsDialog(tk.Toplevel):
         self.configure(bg=C["bg"])
         self.hdr.config(bg=C["sidebar"])
         self.hdr_lbl1.config(bg=C["sidebar"], fg=C["white"])
-        self.hdr_lbl2.config(bg=C["sidebar"], fg=C["ink3"])
+        self.hdr_lbl2.config(bg=C["sidebar"], fg=C["ink2"])
         self.body.config(bg=C["bg"])
 
         for row, l1, l2, vc_key in self.stat_rows:
@@ -985,9 +2457,11 @@ class App(tk.Tk):
         ])
         cascade("Tools", [
             ("Start Quiz  練習",       self._open_quiz),
+            ("JLPT Exam Mode  試験",   self._open_exam),
             ("Dictionary Stats",       self._show_stats),
             "---",
             ("Manage Categories…",     self._manage_categories),
+            ("JLPT Data Manager…",     self._open_jlpt_manager),
             "---",
             ("Export Filtered View…",  self._export_filtered_csv),
         ])
@@ -1024,7 +2498,7 @@ class App(tk.Tk):
             fg=C["red"], bg=C["sidebar"])
         self.logo_lbl1.pack(padx=16, anchor="w")
         self.logo_lbl2 = lbl(self.logo_frame, "Wagochō", font=FONT_UIS,
-            fg=C["ink3"], bg=C["sidebar"])
+            fg=C["ink2"], bg=C["sidebar"])
         self.logo_lbl2.pack(padx=16, anchor="w")
 
         self.sidebar_sep1 = tk.Frame(self.sidebar, bg=C["sidebar3"], height=1)
@@ -1059,13 +2533,15 @@ class App(tk.Tk):
         btn_quiz = FlatButton(self.bot_frame, "練習  Quiz", command=self._open_quiz,
                    font=FONT_UIS, padx=10, pady=6)
         btn_quiz.pack(fill="x", pady=2)
+        btn_exam = FlatButton(self.bot_frame, "試験  Exam", command=self._open_exam,
+                   font=FONT_UIS, padx=10, pady=6)
+        btn_exam.pack(fill="x", pady=2)
         btn_stats = FlatButton(self.bot_frame, "📊  Stats", command=self._show_stats,
                    font=FONT_UIS, padx=10, pady=6)
         btn_stats.pack(fill="x", pady=2)
-        self.sidebar_btns.extend([btn_quiz, btn_stats])
+        self.sidebar_btns.extend([btn_quiz, btn_exam, btn_stats])
 
-
-        # Main panel
+        # main stuff
         self.main = tk.Frame(self, bg=C["bg"])
         self.main.pack(side="right", fill="both", expand=True)
 
@@ -1120,13 +2596,13 @@ class App(tk.Tk):
         self.count_lbl = lbl(self.toolbar_inner, "", font=FONT_UIS)
         self.count_lbl.pack(side="right")
 
-        # Category chips bar (sits below toolbar)
+        # categories
         self.cat_bar = tk.Frame(self.main, highlightthickness=1)
         self.cat_bar.pack(fill="x")
         self.cat_chips_inner = tk.Frame(self.cat_bar)
         self.cat_chips_inner.pack(fill="x", padx=10, pady=5)
 
-        # Table
+
         self.tbl_frame = tk.Frame(self.main)
         self.tbl_frame.pack(fill="both", expand=True)
 
@@ -1208,8 +2684,8 @@ class App(tk.Tk):
         self.configure(bg=C["bg"])
         self.main.config(bg=C["bg"])
         self.status_bar.config(bg=C["bg3"], fg=C["ink2"])
-        self.topbar.config(bg=C.get("white"), highlightbackground=C["bg3"])
-        self.dict_title.config(fg=C["ink"], bg=C.get("white"))
+        self.topbar.config(bg=C["bg"], highlightbackground=C["bg3"])
+        self.dict_title.config(fg=C["ink"], bg=C["bg"])
         self.toolbar.config(bg=C["bg2"], highlightbackground=C["bg3"])
         self.toolbar_inner.config(bg=C["bg2"])
         self.srch_frame.config(bg=C["entry_bg"], highlightbackground=C["bg3"])
@@ -1224,10 +2700,10 @@ class App(tk.Tk):
         self.sidebar.config(bg=C["sidebar"])
         self.logo_frame.config(bg=C["sidebar"])
         self.logo_lbl1.config(fg=C["red"], bg=C["sidebar"])
-        self.logo_lbl2.config(fg=C["ink3"], bg=C["sidebar"])
+        self.logo_lbl2.config(fg=C["ink2"], bg=C["sidebar"])
         self.sidebar_sep1.config(bg=C["sidebar3"])
         self.dict_hdr_frame.config(bg=C["sidebar"])
-        self.dict_hdr_lbl.config(fg=C["ink3"], bg=C["sidebar"])
+        self.dict_hdr_lbl.config(fg=C["ink2"], bg=C["sidebar"])
         self.dict_lb_outer.config(bg=C["sidebar"])
         self.dict_lb.config(bg=C["sidebar"], fg="#CCCCEE", selectbackground=C["sidebar3"], selectforeground=C["white"])
         self.sidebar_sep2.config(bg=C["sidebar3"])
@@ -1235,8 +2711,9 @@ class App(tk.Tk):
 
         self.add_dict_btn.set_colors(C["red"], C["white"], C["red2"])
         for btn in self.sidebar_btns:
-            is_quiz = "Quiz" in btn.cget("text")
-            btn.set_colors(C["sidebar2"], C["white"] if is_quiz else "#AAAACC", C["sidebar3"])
+            txt = btn.cget("text")
+            is_primary = "Quiz" in txt or "Exam" in txt or "試験" in txt or "練習" in txt
+            btn.set_colors(C["sidebar2"], C["white"] if is_primary else "#AAAACC", C["sidebar3"])
         
         self.manage_cat_btn.set_colors(C["bg2"], C["ink2"], C["bg3"])
         self.srch_clear.config(fg=C["ink3"], bg=C["entry_bg"])
@@ -1455,7 +2932,7 @@ class App(tk.Tk):
             c = w.get("category","") or "Uncategorized"
             counts[c] = counts.get(c, 0) + 1
 
-        # "All" chip
+        # all chip
         all_active = len(self._selected_cats) == 0
         all_chip = self._make_chip("All  (%d)" % len(self.current_dict["words"]),
                                     active=all_active)
@@ -1648,6 +3125,16 @@ class App(tk.Tk):
         QuizWindow(self, self.current_dict["words"],
                    categories=sorted({w.get("category","") or "Uncategorized"
                                        for w in self.current_dict["words"]}))
+
+    def _open_exam(self):
+        if not self.current_dict:
+            messagebox.showinfo("No dictionary", "Select a dictionary first.", parent=self); return
+        if not self.current_dict.get("words"):
+            messagebox.showinfo("No words", "Add some words first!", parent=self); return
+        ExamWindow(self, self.current_dict)
+
+    def _open_jlpt_manager(self):
+        JLPTManagerDialog(self, self.current_dict)
 
     def _show_stats(self):
         if not self.current_dict:
