@@ -2608,7 +2608,7 @@ class App(tk.Tk):
 
         cols = ("fav","word","reading","romaji","category","comment","created")
         self.tree = ttk.Treeview(self.tbl_frame, columns=cols, show="headings",
-                                  style="Dict.Treeview", selectmode="browse")
+                                  style="Dict.Treeview", selectmode="extended")
 
         col_cfg = {
             "fav":      ("⭐",    44,  False),
@@ -2636,6 +2636,7 @@ class App(tk.Tk):
         self.tree.bind("<Return>",   self._on_row_double)
         self.tree.bind("<Button-3>", self._tree_context_menu)
         self.tree.bind("<Delete>",   lambda _: self._delete_selected())
+        self.tree.bind("<Control-a>", self._select_all)
 
         self.status_var = tk.StringVar(value="Welcome to 和語帳")
         self.status_bar = tk.Label(self.main, textvariable=self.status_var,
@@ -2855,34 +2856,64 @@ class App(tk.Tk):
             self.status_var.set(f"Updated: {nw['word']}")
 
     def _delete_selected(self):
-        item = self.tree.focus()
-        if not item:
+        items = self.tree.selection()
+        if not items:
             return
-        idx = list(self.tree.get_children()).index(item)
-        if idx >= len(self.all_words):
+        
+        all_children = self.tree.get_children()
+        ids_to_delete = []
+        words_to_delete = []
+        
+        for item in items:
+            idx = list(all_children).index(item)
+            if idx < len(self.all_words):
+                w = self.all_words[idx]
+                ids_to_delete.append(w["id"])
+                words_to_delete.append(w["word"])
+        
+        if not ids_to_delete:
             return
-        word = self.all_words[idx]
-        if not messagebox.askyesno("Delete", f"Delete '{word['word']}'?", parent=self):
+            
+        if len(ids_to_delete) == 1:
+            msg = f"Delete '{words_to_delete[0]}'?"
+        else:
+            msg = f"Delete {len(ids_to_delete)} selected words?"
+            
+        if not messagebox.askyesno("Delete", msg, parent=self):
             return
+            
+        id_set = set(ids_to_delete)
         self.current_dict["words"] = [
-            w for w in self.current_dict["words"] if w["id"] != word["id"]
+            w for w in self.current_dict["words"] if w["id"] not in id_set
         ]
         save_dict(self.current_dict)
         self._apply_filter()
-        self.status_var.set(f"Deleted: {word['word']}")
+        self.status_var.set(f"Deleted {len(ids_to_delete)} items")
+
+    def _select_all(self, event=None):
+        self.tree.selection_set(self.tree.get_children())
+        return "break"
 
     def _toggle_fav(self):
-        item = self.tree.focus()
-        if not item:
+        items = self.tree.selection()
+        if not items:
             return
-        idx = list(self.tree.get_children()).index(item)
-        if idx >= len(self.all_words):
+        
+        all_children = self.tree.get_children()
+        ids_to_toggle = []
+        for item in items:
+            idx = list(all_children).index(item)
+            if idx < len(self.all_words):
+                ids_to_toggle.append(self.all_words[idx]["id"])
+        
+        if not ids_to_toggle:
             return
-        wid = self.all_words[idx]["id"]
+            
+        id_set = set(ids_to_toggle)
         for w in self.current_dict["words"]:
-            if w["id"] == wid:
+            if w["id"] in id_set:
                 w["favorite"] = not w.get("favorite", False)
-                break
+        
         save_dict(self.current_dict)
         self._apply_filter()
 
@@ -2897,14 +2928,22 @@ class App(tk.Tk):
         item = self.tree.identify_row(e.y)
         if not item:
             return
-        self.tree.focus(item)
-        self.tree.selection_set(item)
+            
+        selection = self.tree.selection()
+        if item not in selection:
+            self.tree.selection_set(item)
+            self.tree.focus(item)
+            selection = (item,)
+            
         m = tk.Menu(self, tearoff=0, bg=C["bg2"], fg=C["ink"],
                     activebackground=C["sel"], activeforeground=C["ink"])
-        m.add_command(label="Edit",               command=self._edit_selected)
+        
+        if len(selection) == 1:
+            m.add_command(label="Edit", command=self._edit_selected)
+        
         m.add_command(label="Toggle Favourite ⭐", command=self._toggle_fav)
         m.add_separator()
-        m.add_command(label="Delete",             command=self._delete_selected)
+        m.add_command(label="Delete", command=self._delete_selected)
         m.tk_popup(e.x_root, e.y_root)
 
     # filter / chips
